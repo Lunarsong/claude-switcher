@@ -68,12 +68,14 @@ function Get-ClaudeProfiles {
     } | Sort-Object Name)
 }
 
-# Snapshot the currently signed-in account into its profile (creating it if new).
-# Called on every tray poll so stored refresh tokens never go stale.
-function Sync-ActiveProfile([string]$Name) {
-    $active = Get-ActiveAccount
-    if (-not $active) { return $null }
-    $dir = Join-Path $script:ProfilesDir $active.Id
+function Write-IfChanged([string]$Path, [string]$Text) {
+    if (-not (Test-Path $Path) -or [IO.File]::ReadAllText($Path) -ne $Text) { Write-FileAtomic $Path $Text }
+}
+
+# Store a login (raw credentials JSON + oauthAccount dictionary) as a profile.
+function Save-ProfileSnapshot([string]$CredText, $Account, [string]$Name) {
+    $id = '{0}_{1}' -f $Account['accountUuid'], $Account['organizationUuid']
+    $dir = Join-Path $script:ProfilesDir $id
     if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Force $dir | Out-Null }
 
     $js = New-JsonSerializer
@@ -81,21 +83,112 @@ function Sync-ActiveProfile([string]$Name) {
     $meta = if (Test-Path $metaPath) { $js.DeserializeObject([IO.File]::ReadAllText($metaPath)) } else { @{} }
     if ($Name) { $meta['name'] = $Name }
     if (-not $meta['name']) {
-        $meta['name'] = if ($active.Org) { '{0} ({1})' -f $active.Email, $active.Org } else { $active.Email }
+        $meta['name'] = if ($Account['organizationName']) { '{0} ({1})' -f $Account['emailAddress'], $Account['organizationName'] } else { $Account['emailAddress'] }
     }
-    $meta['email'] = $active.Email
-    $meta['org']   = $active.Org
+    $meta['email'] = $Account['emailAddress']
+    $meta['org']   = $Account['organizationName']
 
-    $cred = [IO.File]::ReadAllText($script:CredFile)
-    $credPath = Join-Path $dir 'credentials.json'
-    if (-not (Test-Path $credPath) -or [IO.File]::ReadAllText($credPath) -ne $cred) { Write-FileAtomic $credPath $cred }
-    $acctJson = $js.Serialize($active.Account)
-    $acctPath = Join-Path $dir 'oauthAccount.json'
-    if (-not (Test-Path $acctPath) -or [IO.File]::ReadAllText($acctPath) -ne $acctJson) { Write-FileAtomic $acctPath $acctJson }
-    $metaJson = $js.Serialize($meta)
-    if (-not (Test-Path $metaPath) -or [IO.File]::ReadAllText($metaPath) -ne $metaJson) { Write-FileAtomic $metaPath $metaJson }
+    Write-IfChanged (Join-Path $dir 'credentials.json') $CredText
+    Write-IfChanged (Join-Path $dir 'oauthAccount.json') ($js.Serialize($Account))
+    Write-IfChanged $metaPath ($js.Serialize($meta))
+    return $id
+}
 
-    return $active.Id
+# Snapshot the currently signed-in account into its profile (creating it if new).
+# Called on every tray poll so stored refresh tokens never go stale.
+function Sync-ActiveProfile([string]$Name) {
+    $active = Get-ActiveAccount
+    if (-not $active) { return $null }
+    return Save-ProfileSnapshot ([IO.File]::ReadAllText($script:CredFile)) $active.Account $Name
+}
+
+# Import a login made in a separate CLAUDE_CONFIG_DIR (see claude-profile add).
+# Does not touch the active login.
+function Import-ClaudeLoginDir([string]$Dir, [string]$Name) {
+    $credPath = Join-Path $Dir '.credentials.json'
+    if (-not (Test-Path $credPath)) { throw "No login found in $Dir (sign-in cancelled?)." }
+    $cfgPath = @((Join-Path $Dir '.claude.json'), (Join-Path $Dir 'config.json')) | Where-Object { Test-Path $_ } | Select-Object -First 1
+    if (-not $cfgPath) { $cfgPath = Get-ChildItem $Dir -Filter '*.json' -Recurse -Force | Where-Object { (Get-Content $_.FullName -Raw) -match '"oauthAccount"' } | Select-Object -First 1 -ExpandProperty FullName }
+    if (-not $cfgPath) { throw "Signed in, but couldn't find the account details in $Dir." }
+    $acct = (New-JsonSerializer).DeserializeObject([IO.File]::ReadAllText($cfgPath))['oauthAccount']
+    if (-not $acct) { throw "Signed in, but no oauthAccount in $cfgPath." }
+    return Save-ProfileSnapshot ([IO.File]::ReadAllText($credPath)) $acct $Name
+}
+
+# ---------- usage for any profile ----------
+$script:UsageUrl     = 'https://api.anthropic.com/api/oauth/usage'
+$script:TokenUrl     = 'https://platform.claude.com/v1/oauth/token'   # same endpoint/client Claude Code uses
+$script:OAuthClient  = '9d1c250a-e61b-44d9-88ed-5944d1962f5e'
+
+# Access token for a profile. The active account always uses the live file
+# (Claude Code owns refreshing it). Inactive profiles are refreshed here when
+# expired and the rotated tokens are written straight back to the profile.
+function Get-ProfileAccessToken($P) {
+    $js = New-JsonSerializer
+    if ($P.Active) {
+        return ($js.DeserializeObject([IO.File]::ReadAllText($script:CredFile)))['claudeAiOauth']['accessToken']
+    }
+    $credPath = Join-Path $P.Path 'credentials.json'
+    $cred = $js.DeserializeObject([IO.File]::ReadAllText($credPath))
+    $o = $cred['claudeAiOauth']
+    $nowMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+    if ($o['expiresAt'] -and ([int64]$o['expiresAt'] - $nowMs) -gt 300000) { return $o['accessToken'] }
+
+    $body = @{ grant_type = 'refresh_token'; refresh_token = $o['refreshToken']; client_id = $script:OAuthClient }
+    if ($o['scopes']) { $body.scope = (@($o['scopes']) -join ' ') }
+    try {
+        $r = Invoke-RestMethod -Method Post -Uri $script:TokenUrl -ContentType 'application/json' -Body ($body | ConvertTo-Json) -TimeoutSec 20 -UseBasicParsing
+    } catch {
+        throw 'Saved login expired and could not be refreshed. Switch to this account in Claude Code (or sign in again).'
+    }
+    $o['accessToken'] = $r.access_token
+    if ($r.refresh_token) { $o['refreshToken'] = $r.refresh_token }
+    $o['expiresAt'] = $nowMs + [int64]$r.expires_in * 1000
+    # Rotated refresh token: persist immediately or the profile is lost.
+    Write-FileAtomic $credPath ($js.Serialize($cred))
+    return $o['accessToken']
+}
+
+function ConvertFrom-UsageDate($s) {
+    if (-not $s) { return $null }
+    try { return [datetime]::Parse($s, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind) } catch { return $null }
+}
+
+# Returns @( @{ Label; Used; Resets } ... ) for a token. Throws with a readable message.
+function Get-UsageRows([string]$Token) {
+    $headers = @{ Authorization = "Bearer $Token"; 'anthropic-beta' = 'oauth-2025-04-20' }
+    try {
+        $r = Invoke-RestMethod -Uri $script:UsageUrl -Headers $headers -TimeoutSec 15 -UseBasicParsing
+    } catch {
+        $code = $null
+        try { $code = [int]$_.Exception.Response.StatusCode } catch {}
+        if ($code -eq 401) { throw 'Token expired. Open Claude Code once to refresh it.' }
+        throw "Request failed: $($_.Exception.Message)"
+    }
+
+    $rows = @()
+    if ($r.limits) {
+        foreach ($l in $r.limits) {
+            $label = switch ($l.kind) {
+                'session'       { 'Session (5h)' }
+                'weekly_all'    { 'Weekly' }
+                'weekly_scoped' {
+                    $n = $l.scope.model.display_name
+                    if (-not $n) { $n = $l.scope.surface }
+                    if ($n) { "Weekly $n" } else { 'Weekly (scoped)' }
+                }
+                default         { ($l.kind -replace '_', ' ') }
+            }
+            $rows += @{ Label = $label; Used = [double]$l.percent; Resets = (ConvertFrom-UsageDate $l.resets_at) }
+        }
+    } else {
+        foreach ($k in @(@('five_hour', 'Session (5h)'), @('seven_day', 'Weekly'), @('seven_day_opus', 'Weekly Opus'), @('seven_day_sonnet', 'Weekly Sonnet'))) {
+            $v = $r.($k[0])
+            if ($v) { $rows += @{ Label = $k[1]; Used = [double]$v.utilization; Resets = (ConvertFrom-UsageDate $v.resets_at) } }
+        }
+    }
+    if (-not $rows) { throw 'Usage response contained no limits.' }
+    return ,$rows
 }
 
 function Find-ClaudeProfile([string]$NameOrId) {

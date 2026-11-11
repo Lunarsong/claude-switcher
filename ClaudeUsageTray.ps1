@@ -63,6 +63,12 @@ $script:Rows      = @()      # @{ Label; Used; Resets }
 $script:LastErr     = $null
 $script:LastOk    = $null
 $script:LastHIcon = [IntPtr]::Zero
+$script:Others    = @()      # @{ Id; Name; Rows; Err } for non-active saved accounts
+$script:BtnAll    = [System.Drawing.Rectangle]::Empty
+$script:BtnAdd    = [System.Drawing.Rectangle]::Empty
+$script:AddProc   = $null
+if ($null -eq $Settings.ShowAll) { $Settings.ShowAll = $false }
+if ($null -eq $Settings.ShowRemaining) { $Settings.ShowRemaining = $false }
 
 # ---------- helpers ----------
 function Format-Until($when) {
@@ -72,6 +78,13 @@ function Format-Until($when) {
     if ($span.TotalDays -ge 1) { return ('{0}d {1}h' -f [int][math]::Floor($span.TotalDays), $span.Hours) }
     if ($span.TotalHours -ge 1) { return ('{0}h {1}m' -f [int][math]::Floor($span.TotalHours), $span.Minutes) }
     return ('{0}m' -f [math]::Max(1, [int][math]::Ceiling($span.TotalMinutes)))
+}
+
+# "3% used" by default (bars fill up as you use them, like claude.ai);
+# "97% left" when ShowRemaining is on.
+function Format-Pct($r) {
+    if ($Settings.ShowRemaining) { return ('{0}% left' -f [int][math]::Max(0, 100 - $r.Used)) }
+    return ('{0}% used' -f [int][math]::Min(100, $r.Used))
 }
 
 function Get-LevelColor([double]$left) {
@@ -90,52 +103,46 @@ function Update-Usage {
     try {
         Sync-ActiveProfile | Out-Null
         $script:ActiveName = (Get-ClaudeProfiles | Where-Object Active | Select-Object -First 1).Name
+        $script:ProfSig = Get-ProfilesSignature
     } catch {}
     try {
         if (-not (Test-Path $CredPath)) { throw "No Claude Code login found ($CredPath). Run 'claude' and log in." }
         $cred = (Get-Content $CredPath -Raw | ConvertFrom-Json).claudeAiOauth
         if (-not $cred.accessToken) { throw 'No OAuth token in credentials file. Run ''claude'' and log in.' }
 
-        $headers = @{ Authorization = "Bearer $($cred.accessToken)"; 'anthropic-beta' = 'oauth-2025-04-20' }
-        try {
-            $r = Invoke-RestMethod -Uri $UsageUrl -Headers $headers -TimeoutSec 15 -UseBasicParsing
-        } catch {
-            $code = $null
-            try { $code = [int]$_.Exception.Response.StatusCode } catch {}
-            if ($code -eq 401) { throw 'Token expired. Open Claude Code once to refresh it.' }
-            throw "Request failed: $($_.Exception.Message)"
-        }
-
-        $rows = @()
-        if ($r.limits) {
-            foreach ($l in $r.limits) {
-                $label = switch ($l.kind) {
-                    'session'       { 'Session (5h)' }
-                    'weekly_all'    { 'Weekly' }
-                    'weekly_scoped' {
-                        $n = $l.scope.model.display_name
-                        if (-not $n) { $n = $l.scope.surface }
-                        if ($n) { "Weekly $n" } else { 'Weekly (scoped)' }
-                    }
-                    default         { ($l.kind -replace '_', ' ') }
-                }
-                $rows += @{ Label = $label; Used = [double]$l.percent; Resets = (Parse-Date $l.resets_at) }
-            }
-        } else {
-            if ($r.five_hour)  { $rows += @{ Label = 'Session (5h)'; Used = [double]$r.five_hour.utilization;  Resets = (Parse-Date $r.five_hour.resets_at) } }
-            if ($r.seven_day)  { $rows += @{ Label = 'Weekly';       Used = [double]$r.seven_day.utilization;  Resets = (Parse-Date $r.seven_day.resets_at) } }
-            if ($r.seven_day_opus)   { $rows += @{ Label = 'Weekly Opus';   Used = [double]$r.seven_day_opus.utilization;   Resets = (Parse-Date $r.seven_day_opus.resets_at) } }
-            if ($r.seven_day_sonnet) { $rows += @{ Label = 'Weekly Sonnet'; Used = [double]$r.seven_day_sonnet.utilization; Resets = (Parse-Date $r.seven_day_sonnet.resets_at) } }
-        }
-        if (-not $rows) { throw 'Usage response contained no limits.' }
-
-        $script:Rows   = $rows
-        $script:LastErr  = $null
-        $script:LastOk = Get-Date
+        $script:Rows    = Get-UsageRows $cred.accessToken
+        $script:LastErr = $null
+        $script:LastOk  = Get-Date
     } catch {
         $script:LastErr = $_.Exception.Message
     }
+    if ($Settings.ShowAll) { Update-OtherAccounts }
     Update-Ui
+}
+
+# Usage for every saved account except the active one (only while "All" is on).
+function Update-OtherAccounts {
+    $list = @()
+    foreach ($p in (Get-ClaudeProfiles | Where-Object { -not $_.Active })) {
+        $entry = @{ Id = $p.Id; Name = $p.Name; Rows = @(); Err = $null }
+        try { $entry.Rows = Get-UsageRows (Get-ProfileAccessToken $p) } catch { $entry.Err = $_.Exception.Message }
+        $list += $entry
+    }
+    $script:Others = $list
+}
+
+function Get-OverlayHeight {
+    $h = 30 + [math]::Max(1, @($script:Rows).Count) * 34
+    if ($Settings.ShowAll) {
+        $h += 12   # divider
+        if (-not $script:Others) { $h += 20 }
+        foreach ($o in $script:Others) {
+            $h += 20
+            $h += if ($o.Err) { 30 } else { @($o.Rows).Count * 30 }
+        }
+        $h += 4
+    }
+    return $h
 }
 
 # The binding limit = the one with the least left.
@@ -157,7 +164,8 @@ function New-TrayIcon {
     } else {
         $left = [math]::Max(0, 100 - $t.Used)
         $bg = Get-LevelColor $left
-        $text = if ($left -ge 100) { '99' } else { [string][int][math]::Floor($left) }
+        $shown = if ($Settings.ShowRemaining) { $left } else { [math]::Min(100, $t.Used) }
+        $text = if ($shown -ge 100) { if ($Settings.ShowRemaining) { '99' } else { '!' } } else { [string][int][math]::Floor($shown) }
         if ($script:LastErr) { $bg = [System.Drawing.Color]::FromArgb(110, 110, 110) }  # stale
     }
 
@@ -188,7 +196,7 @@ function Update-Ui {
     if ($script:Rows) {
         $parts = foreach ($r in $script:Rows) {
             $lbl = $r.Label -replace 'Session \(5h\)', '5h' -replace 'Weekly ', 'Wk '
-            '{0}: {1}% left' -f $lbl, [int](100 - $r.Used)
+            '{0}: {1}' -f $lbl, (Format-Pct $r)
         }
         $tip = 'Claude  ' + ($parts -join ' | ')
         if ($script:LastErr) { $tip = '[stale] ' + $tip }
@@ -198,7 +206,10 @@ function Update-Ui {
     if ($tip.Length -gt 127) { $tip = $tip.Substring(0, 124) + '...' }
     $tray.Text = $tip
 
-    $overlay.Height = [math]::Max(1, $script:Rows.Count) * 34 + 30
+    $overlay.Height = Get-OverlayHeight
+    # Grow upwards if the taller overlay would run off the bottom of its screen.
+    $scr = [System.Windows.Forms.Screen]::FromControl($overlay).WorkingArea
+    if ($overlay.Bottom -gt $scr.Bottom) { $overlay.Top = [math]::Max($scr.Top, $scr.Bottom - $overlay.Height - 8) }
     $overlay.Invalidate()
 }
 
@@ -216,12 +227,36 @@ $miWeb     = $menu.Items.Add('Open claude.ai usage page')
 $miStartup = $menu.Items.Add('Start with Windows')
 $miStartup.CheckOnClick = $true
 $miStartup.Checked = Test-Path $StartupLnk
+$miShowAll = $menu.Items.Add('Show all accounts')
+$miShowAll.Checked = [bool]$Settings.ShowAll
+$miRemain  = $menu.Items.Add('Show remaining instead of used')
+$miRemain.CheckOnClick = $true
+$miRemain.Checked = [bool]$Settings.ShowRemaining
+$miRemain.Add_CheckedChanged({ $Settings.ShowRemaining = $miRemain.Checked; Save-Settings; Update-Ui })
 $menu.Items.Add('-') | Out-Null
 $miAccount = New-Object System.Windows.Forms.ToolStripMenuItem 'Account'
 $menu.Items.Add($miAccount) | Out-Null
 $miAccount.DropDownItems.Add('(loading)') | Out-Null   # placeholder so the arrow shows
 $menu.Items.Add('-') | Out-Null
 $miExit = $menu.Items.Add('Exit')
+
+# Sign-in is interactive (browser + console), so run claude-profile add in its own
+# window. It logs in to a temporary config dir, so the active account is untouched,
+# then asks whether to switch. We refresh once that window closes.
+function Start-AddAccount {
+    if ($script:AddProc -and -not $script:AddProc.HasExited) { return }
+    $cmd = "try { & '$ProfileCli' add } catch { Write-Host `$_.Exception.Message -ForegroundColor Red }; Read-Host 'Press Enter to close'"
+    $script:AddProc = Start-Process powershell.exe -PassThru -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', $cmd
+    $addWatch.Start()
+}
+
+function Set-ShowAll([bool]$on) {
+    $Settings.ShowAll = $on
+    $miShowAll.Checked = $on
+    Save-Settings
+    if ($on) { Update-OtherAccounts } else { $script:Others = @() }
+    Update-Ui
+}
 
 function Invoke-SwitchAccount($id) {
     try {
@@ -248,11 +283,8 @@ $miAccount.Add_DropDownOpening({
     }
     $miAccount.DropDownItems.Add('-') | Out-Null
 
-    $add = $miAccount.DropDownItems.Add('Sign in to another account...')
-    $add.Add_Click({
-        # Interactive login needs a console; the new account is picked up automatically.
-        Start-Process powershell.exe -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-NoExit', '-File', "`"$ProfileCli`"", 'login'
-    })
+    $add = $miAccount.DropDownItems.Add('Add account (without switching)...')
+    $add.Add_Click({ Start-AddAccount })
 
     $ren = $miAccount.DropDownItems.Add('Rename current account...')
     $ren.Add_Click({
@@ -296,6 +328,8 @@ $fontSmall = New-Object System.Drawing.Font('Segoe UI', 7.5)
 $fgMain  = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(235, 235, 240))
 $fgDim   = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(150, 150, 160))
 $trackBr = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(60, 60, 68))
+$btnBr   = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(55, 55, 64))
+$btnOnBr = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(70, 95, 160))
 
 $overlay.Add_Paint({
     param($s, $e)
@@ -304,42 +338,75 @@ $overlay.Add_Paint({
     $g.TextRenderingHint = 'ClearTypeGridFit'
     $w = $overlay.ClientSize.Width
 
-    $title = if ($script:ActiveName) { $script:ActiveName } else { 'Claude usage left' }
     $tf = New-Object System.Drawing.StringFormat
     $tf.Trimming = 'EllipsisCharacter'; $tf.FormatFlags = 'NoWrap'
-    $g.DrawString($title, $fontTitle, $fgMain, (New-Object System.Drawing.RectangleF(10, 6, ($w - 60), 16)), $tf)
-    $tf.Dispose()
+    $cf = New-Object System.Drawing.StringFormat
+    $cf.Alignment = 'Center'; $cf.LineAlignment = 'Center'
+
+    # Header: [account name ...] [time] [All] [+]
+    $script:BtnAdd = New-Object System.Drawing.Rectangle(($w - 26), 5, 20, 17)
+    $script:BtnAll = New-Object System.Drawing.Rectangle(($w - 56), 5, 27, 17)
+    $allBg = if ($Settings.ShowAll) { $btnOnBr } else { $btnBr }
+    $g.FillRectangle($allBg, $script:BtnAll)
+    $g.DrawString('All', $fontSmall, $fgMain, [System.Drawing.RectangleF]$script:BtnAll, $cf)
+    $g.FillRectangle($btnBr, $script:BtnAdd)
+    $g.DrawString('+', $fontTitle, $fgMain, [System.Drawing.RectangleF]$script:BtnAdd, $cf)
+
     $status = if ($script:LastErr) { 'stale' } elseif ($script:LastOk) { $script:LastOk.ToString('HH:mm') } else { '...' }
     $sz = $g.MeasureString($status, $fontSmall)
-    $g.DrawString($status, $fontSmall, $fgDim, ($w - $sz.Width - 8), 8)
+    $g.DrawString($status, $fontSmall, $fgDim, ($w - 60 - $sz.Width), 8)
 
-    if (-not $script:Rows) {
-        $msg = if ($script:LastErr) { $script:LastErr } else { 'Loading...' }
-        $g.DrawString($msg, $fontSmall, $fgDim, (New-Object System.Drawing.RectangleF(10, 28, ($w - 20), 60)))
-        return
-    }
+    $title = if ($script:ActiveName) { $script:ActiveName } else { 'Claude usage' }
+    $g.DrawString($title, $fontTitle, $fgMain, (New-Object System.Drawing.RectangleF(10, 6, ($w - 72 - $sz.Width), 16)), $tf)
 
     $y = 28
-    foreach ($r in $script:Rows) {
-        $left = [math]::Max(0, [math]::Min(100, 100 - $r.Used))
-        $g.DrawString($r.Label, $fontRow, $fgMain, 10, $y)
-        $right = '{0}% - {1}' -f [int]$left, (Format-Until $r.Resets)
-        $sz = $g.MeasureString($right, $fontSmall)
-        $g.DrawString($right, $fontSmall, $fgDim, ($w - $sz.Width - 8), ($y + 1))
-
-        $barW = $w - 20
-        $g.FillRectangle($trackBr, 10, ($y + 18), $barW, 6)
-        $fill = New-Object System.Drawing.SolidBrush (Get-LevelColor $left)
-        $g.FillRectangle($fill, 10, ($y + 18), [float]($barW * $left / 100), 6)
-        $fill.Dispose()
+    if (-not $script:Rows) {
+        $msg = if ($script:LastErr) { $script:LastErr } else { 'Loading...' }
+        $g.DrawString($msg, $fontSmall, $fgDim, (New-Object System.Drawing.RectangleF(10, 28, ($w - 20), 30)))
         $y += 34
     }
+    foreach ($r in $script:Rows) { Draw-UsageRow $g $r $y $w 18; $y += 34 }
+
+    if ($Settings.ShowAll) {
+        $g.FillRectangle($trackBr, 10, ($y + 2), ($w - 20), 1)
+        $y += 10
+        if (-not $script:Others) {
+            $g.DrawString('No other saved accounts. Click + to add one.', $fontSmall, $fgDim, 10, $y)
+        }
+        foreach ($o in $script:Others) {
+            $g.DrawString($o.Name, $fontTitle, $fgDim, (New-Object System.Drawing.RectangleF(10, $y, ($w - 20), 16)), $tf)
+            $y += 20
+            if ($o.Err) {
+                $g.DrawString($o.Err, $fontSmall, $fgDim, (New-Object System.Drawing.RectangleF(10, $y, ($w - 20), 28)))
+                $y += 30
+            } else {
+                foreach ($r in $o.Rows) { Draw-UsageRow $g $r $y $w 16; $y += 30 }
+            }
+        }
+    }
+    $tf.Dispose(); $cf.Dispose()
 })
+
+function Draw-UsageRow($g, $r, [int]$y, [int]$w, [int]$barOffset) {
+    $left = [math]::Max(0, [math]::Min(100, 100 - $r.Used))
+    $fillPct = if ($Settings.ShowRemaining) { $left } else { 100 - $left }
+    $g.DrawString($r.Label, $fontRow, $fgMain, 10, $y)
+    $right = '{0} - {1}' -f (Format-Pct $r), (Format-Until $r.Resets)
+    $sz = $g.MeasureString($right, $fontSmall)
+    $g.DrawString($right, $fontSmall, $fgDim, ($w - $sz.Width - 8), ($y + 1))
+    $barW = $w - 20
+    $g.FillRectangle($trackBr, 10, ($y + $barOffset), $barW, 6)
+    $fill = New-Object System.Drawing.SolidBrush (Get-LevelColor $left)
+    $g.FillRectangle($fill, 10, ($y + $barOffset), [float]($barW * $fillPct / 100), 6)
+    $fill.Dispose()
+}
 
 # drag to move
 $overlay.Add_MouseDown({
     param($s, $e)
     if ($e.Button -eq 'Left') {
+        if ($script:BtnAll.Contains($e.Location)) { Set-ShowAll (-not $Settings.ShowAll); return }
+        if ($script:BtnAdd.Contains($e.Location)) { Start-AddAccount; return }
         [Native.Win32]::ReleaseCapture() | Out-Null
         [Native.Win32]::SendMessage($overlay.Handle, 0xA1, 0x2, 0) | Out-Null   # WM_NCLBUTTONDOWN, HTCAPTION
         $Settings.X = $overlay.Left; $Settings.Y = $overlay.Top
@@ -355,6 +422,7 @@ $miOverlay.Add_CheckedChanged({
     Save-Settings
 })
 $miRefresh.Add_Click({ Update-Usage })
+$miShowAll.Add_Click({ Set-ShowAll (-not $Settings.ShowAll) })
 $miWeb.Add_Click({ Start-Process 'https://claude.ai/settings/usage' })
 $miStartup.Add_CheckedChanged({
     if ($miStartup.Checked) {
@@ -384,10 +452,39 @@ $timer = New-Object System.Windows.Forms.Timer
 $timer.Interval = [math]::Max(30, [int]$Settings.IntervalSec) * 1000
 $timer.Add_Tick({ Update-Usage })
 
-# repaint countdowns every 30s without hitting the API
+# Profiles folder + active account fingerprint. Changes when an account is added,
+# removed, or switched - from the tray, the CLI, or anywhere else.
+function Get-ProfilesSignature {
+    $ids = if (Test-Path $script:ProfilesDir) { (Get-ChildItem $script:ProfilesDir -Directory | ForEach-Object Name) -join ',' } else { '' }
+    $active = try { (Get-ActiveAccount).Id } catch { '' }
+    return "$ids|$active"
+}
+function Test-ProfilesChanged {
+    $sig = Get-ProfilesSignature
+    if ($sig -eq $script:ProfSig) { return $false }
+    $script:ProfSig = $sig
+    return $true
+}
+$script:ProfSig = Get-ProfilesSignature
+
+# While the add-account console is open, watch closely so the new account shows up
+# as soon as it's saved (not when the window is closed).
+$addWatch = New-Object System.Windows.Forms.Timer
+$addWatch.Interval = 1500
+$addWatch.Add_Tick({
+    $done = (-not $script:AddProc -or $script:AddProc.HasExited)
+    if ($done) { $addWatch.Stop() }
+    if ((Test-ProfilesChanged) -or $done) {
+        if (-not $Settings.ShowAll) { Set-ShowAll $true } else { Update-Usage }
+    }
+})
+
+# Every 30s: repaint countdowns, and pick up accounts added/switched elsewhere.
 $tickTimer = New-Object System.Windows.Forms.Timer
 $tickTimer.Interval = 30000
-$tickTimer.Add_Tick({ $overlay.Invalidate() })
+$tickTimer.Add_Tick({
+    if (Test-ProfilesChanged) { Update-Usage } else { $overlay.Invalidate() }
+})
 
 # ---------- go ----------
 $overlay.Show()

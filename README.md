@@ -2,8 +2,9 @@
 
 A Windows tray icon and a small always-on-top overlay that show how much of your Claude subscription limits you have left.
 
-- **Tray icon:** a coloured circle showing the % left on your *tightest* limit. Green is more than 30% left, amber is 10–30%, red is under 10%, and grey means the data is stale or there was an error. Hover over it for every limit.
-- **Overlay:** one bar per limit: the 5-hour session, weekly, and per-model weekly (such as "Weekly Fable"). Each bar shows % left and time until it resets. Drag the overlay to move it (its position is saved), and double-click it to refresh.
+- **Tray icon:** a coloured circle showing the % used on your *tightest* limit. It's green while under 70% used, amber at 70–90%, red above 90%, and grey when the data is stale or there was an error. Hover over it for every limit.
+- **Overlay:** one bar per limit: the 5-hour session, weekly, and per-model weekly (such as "Weekly Fable"). Like claude.ai, bars start empty and fill as you use them, with the % used and time until reset. Turn on **Show remaining instead of used** in the menu to flip this. Drag the overlay to move it (its position is saved), and double-click it to refresh.
+- New, removed or switched accounts are picked up automatically within 30 seconds, including ones changed from the CLI.
 - **Right-click menu** (tray or overlay): Show overlay, Refresh now, Open claude.ai usage page, Start with Windows, Exit. Left-clicking the tray icon toggles the overlay.
 
 ## Switching accounts
@@ -11,16 +12,33 @@ A Windows tray icon and a small always-on-top overlay that show how much of your
 There's no public profiles API. Claude Code keeps its login in two places: `~/.claude/.credentials.json` holds the tokens, and the `oauthAccount` block in `~/.claude.json` records which account and org you're signed in to. A **profile** is a snapshot of both, stored in `%APPDATA%\ClaudeUsageTray\profiles\`.
 
 - The tray saves the signed-in account as a profile automatically and keeps its tokens fresh on every poll.
-- **Tray → Account:** pick an account to switch to, sign in to another account (this opens a console running `claude auth login`), rename the current account, or open the profiles folder.
-- **CLI:**
-  ```
-  claude-profile                  list (* = active)
-  claude-profile use <name>       switch (name, email, or part of either)
-  claude-profile login            sign in to another account; the current one is saved first
-  claude-profile save [name]      save or refresh the current account
-  claude-profile rename <name> <new name>
-  claude-profile remove <name>
-  ```
+
+### Adding an account (without switching)
+
+Click **+** on the overlay, choose **Account → Add account (without switching)…** from the tray, or run `claude-profile add`.
+
+1. A console window opens and runs `claude auth login` with `CLAUDE_CONFIG_DIR` pointing at a throwaway temp folder. Your current login is never touched.
+2. Sign in to the other account in the browser.
+3. The new login is saved as a profile and the temp folder is deleted.
+4. The console asks **"Switch to it now? [y/N]"**. Press Enter to stay on your current account.
+
+### Seeing every account's usage
+
+Click **All** on the overlay (or **Show all accounts** in the menu) to list usage for every saved account under the active one. You can also run `claude-profile usage` in a terminal. Inactive accounts use their saved tokens. When a saved access token expires, it's refreshed through the same OAuth endpoint Claude Code uses, and the new tokens are written straight back to that profile. The active account's tokens are never refreshed here; Claude Code owns those.
+
+### Switching
+
+**Tray → Account** lists your saved accounts; click one to switch. The same submenu has rename and "open profiles folder". From the CLI:
+
+```
+claude-profile                  list (* = active)
+claude-profile add [name]       add an account without switching
+claude-profile use <name>       switch (name, email, or part of either)
+claude-profile usage            usage for every saved account
+claude-profile save [name]      save or refresh the current account
+claude-profile rename <name> <new name>
+claude-profile remove <name>
+```
 
 After switching, **restart any running Claude Code sessions**. A running session keeps the old login in memory and could write its refreshed tokens back over the switch. Before every switch, the previous `~/.claude.json` is kept as `~/.claude.json.switcher-backup`.
 
