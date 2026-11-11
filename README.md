@@ -6,6 +6,26 @@ A Windows tray icon and a small always-on-top overlay that show how much of your
 - **Overlay:** one bar per limit: the 5-hour session, weekly, and per-model weekly (such as "Weekly Fable"). Each bar shows % left and time until it resets. Drag the overlay to move it (its position is saved), and double-click it to refresh.
 - **Right-click menu** (tray or overlay): Show overlay, Refresh now, Open claude.ai usage page, Start with Windows, Exit. Left-clicking the tray icon toggles the overlay.
 
+## Switching accounts
+
+There's no public profiles API. Claude Code keeps its login in two places: `~/.claude/.credentials.json` holds the tokens, and the `oauthAccount` block in `~/.claude.json` records which account and org you're signed in to. A **profile** is a snapshot of both, stored in `%APPDATA%\ClaudeUsageTray\profiles\`.
+
+- The tray saves the signed-in account as a profile automatically and keeps its tokens fresh on every poll.
+- **Tray → Account:** pick an account to switch to, sign in to another account (this opens a console running `claude auth login`), rename the current account, or open the profiles folder.
+- **CLI:**
+  ```
+  claude-profile                  list (* = active)
+  claude-profile use <name>       switch (name, email, or part of either)
+  claude-profile login            sign in to another account; the current one is saved first
+  claude-profile save [name]      save or refresh the current account
+  claude-profile rename <name> <new name>
+  claude-profile remove <name>
+  ```
+
+After switching, **restart any running Claude Code sessions**. A running session keeps the old login in memory and could write its refreshed tokens back over the switch. Before every switch, the previous `~/.claude.json` is kept as `~/.claude.json.switcher-backup`.
+
+Profile folders contain live login tokens, so treat them like `~/.claude` itself: don't sync or share them.
+
 ## Run
 
 Double-click `start-usage-tray.vbs`, or:

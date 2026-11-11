@@ -42,6 +42,9 @@ $SettingsDir  = Join-Path $env:APPDATA 'ClaudeUsageTray'
 $SettingsPath = Join-Path $SettingsDir 'settings.json'
 $StartupLnk   = Join-Path ([Environment]::GetFolderPath('Startup')) 'Claude Usage Tray.lnk'
 $Launcher     = Join-Path $PSScriptRoot 'start-usage-tray.vbs'
+$ProfileCli   = Join-Path $PSScriptRoot 'claude-profile.ps1'
+. (Join-Path $PSScriptRoot 'ClaudeProfiles.ps1')
+$script:ActiveName = $null
 
 $Settings = [ordered]@{ ShowOverlay = $true; X = -1; Y = -1; IntervalSec = 120; Opacity = 0.92 }
 if (Test-Path $SettingsPath) {
@@ -83,6 +86,11 @@ function Parse-Date($s) {
 }
 
 function Update-Usage {
+    # Keep the active account's profile snapshot current (tokens rotate on refresh).
+    try {
+        Sync-ActiveProfile | Out-Null
+        $script:ActiveName = (Get-ClaudeProfiles | Where-Object Active | Select-Object -First 1).Name
+    } catch {}
     try {
         if (-not (Test-Path $CredPath)) { throw "No Claude Code login found ($CredPath). Run 'claude' and log in." }
         $cred = (Get-Content $CredPath -Raw | ConvertFrom-Json).claudeAiOauth
@@ -209,7 +217,55 @@ $miStartup = $menu.Items.Add('Start with Windows')
 $miStartup.CheckOnClick = $true
 $miStartup.Checked = Test-Path $StartupLnk
 $menu.Items.Add('-') | Out-Null
+$miAccount = New-Object System.Windows.Forms.ToolStripMenuItem 'Account'
+$menu.Items.Add($miAccount) | Out-Null
+$miAccount.DropDownItems.Add('(loading)') | Out-Null   # placeholder so the arrow shows
+$menu.Items.Add('-') | Out-Null
 $miExit = $menu.Items.Add('Exit')
+
+function Invoke-SwitchAccount($id) {
+    try {
+        $p = Switch-ClaudeProfile $id
+        Update-Usage
+        $tray.ShowBalloonTip(4000, 'Claude account switched', "Now using $($p.Name). Restart any running Claude Code sessions.", 'Info')
+    } catch {
+        $tray.ShowBalloonTip(5000, 'Switch failed', $_.Exception.Message, 'Error')
+    }
+}
+
+# Rebuild the account list every time the submenu opens.
+$miAccount.Add_DropDownOpening({
+    $miAccount.DropDownItems.Clear()
+    try { Sync-ActiveProfile | Out-Null } catch {}
+    $profiles = Get-ClaudeProfiles
+    if (-not $profiles) { $x = $miAccount.DropDownItems.Add('(no saved accounts)'); $x.Enabled = $false }
+    foreach ($p in $profiles) {
+        $item = New-Object System.Windows.Forms.ToolStripMenuItem $p.Name
+        $item.Checked = $p.Active
+        $item.Tag = $p.Id
+        $item.Add_Click({ param($s, $e) Invoke-SwitchAccount $s.Tag })
+        $miAccount.DropDownItems.Add($item) | Out-Null
+    }
+    $miAccount.DropDownItems.Add('-') | Out-Null
+
+    $add = $miAccount.DropDownItems.Add('Sign in to another account...')
+    $add.Add_Click({
+        # Interactive login needs a console; the new account is picked up automatically.
+        Start-Process powershell.exe -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-NoExit', '-File', "`"$ProfileCli`"", 'login'
+    })
+
+    $ren = $miAccount.DropDownItems.Add('Rename current account...')
+    $ren.Add_Click({
+        Add-Type -AssemblyName Microsoft.VisualBasic
+        $cur = Get-ClaudeProfiles | Where-Object Active | Select-Object -First 1
+        if (-not $cur) { return }
+        $new = [Microsoft.VisualBasic.Interaction]::InputBox('Display name for this account:', 'Rename account', $cur.Name)
+        if ($new) { Rename-ClaudeProfile $cur.Id $new; $script:ActiveName = $new; $overlay.Invalidate() }
+    })
+
+    $folder = $miAccount.DropDownItems.Add('Open profiles folder')
+    $folder.Add_Click({ if (-not (Test-Path $script:ProfilesDir)) { New-Item -ItemType Directory -Force $script:ProfilesDir | Out-Null }; Start-Process explorer.exe $script:ProfilesDir })
+})
 $tray.ContextMenuStrip = $menu
 
 # ---------- overlay ----------
@@ -248,7 +304,11 @@ $overlay.Add_Paint({
     $g.TextRenderingHint = 'ClearTypeGridFit'
     $w = $overlay.ClientSize.Width
 
-    $g.DrawString('Claude usage left', $fontTitle, $fgMain, 10, 6)
+    $title = if ($script:ActiveName) { $script:ActiveName } else { 'Claude usage left' }
+    $tf = New-Object System.Drawing.StringFormat
+    $tf.Trimming = 'EllipsisCharacter'; $tf.FormatFlags = 'NoWrap'
+    $g.DrawString($title, $fontTitle, $fgMain, (New-Object System.Drawing.RectangleF(10, 6, ($w - 60), 16)), $tf)
+    $tf.Dispose()
     $status = if ($script:LastErr) { 'stale' } elseif ($script:LastOk) { $script:LastOk.ToString('HH:mm') } else { '...' }
     $sz = $g.MeasureString($status, $fontSmall)
     $g.DrawString($status, $fontSmall, $fgDim, ($w - $sz.Width - 8), 8)
