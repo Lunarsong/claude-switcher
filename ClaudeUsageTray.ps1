@@ -69,6 +69,12 @@ $script:BtnAdd    = [System.Drawing.Rectangle]::Empty
 $script:AddProc   = $null
 if ($null -eq $Settings.ShowAll) { $Settings.ShowAll = $false }
 if ($null -eq $Settings.ShowRemaining) { $Settings.ShowRemaining = $false }
+if ($null -eq $Settings.AutoSwitch)        { $Settings.AutoSwitch = $false }
+if ($null -eq $Settings.AutoSwitchAt)      { $Settings.AutoSwitchAt = 99 }    # switch when any limit hits this % used
+if ($null -eq $Settings.AutoSwitchMinLeft) { $Settings.AutoSwitchMinLeft = 10 } # target needs >= this % left on every limit
+$script:AutoCooldownUntil = [datetime]::MinValue
+$script:AutoNotified      = $false
+$script:SwitchRects       = @()   # clickable account names in the overlay: @{ Rect; Id }
 
 # ---------- helpers ----------
 function Format-Until($when) {
@@ -117,24 +123,57 @@ function Update-Usage {
         $script:LastErr = $_.Exception.Message
     }
     if ($Settings.ShowAll) { Update-OtherAccounts }
+    if (Invoke-AutoSwitch) { return }   # switched: it already refreshed everything
     Update-Ui
 }
 
-# Usage for every saved account except the active one (only while "All" is on).
+# Usage for every saved account except the active one. Fetched each poll while
+# "All" is on, otherwise only when auto-switch needs it.
 function Update-OtherAccounts {
     $list = @()
     foreach ($p in (Get-ClaudeProfiles | Where-Object { -not $_.Active })) {
-        $entry = @{ Id = $p.Id; Name = $p.Name; Rows = @(); Err = $null }
+        $entry = @{ Id = $p.Id; Name = $p.Name; Rows = @(); Err = $null; Eligible = $false }
         try { $entry.Rows = Get-UsageRows (Get-ProfileAccessToken $p) } catch { $entry.Err = $_.Exception.Message }
         $list += $entry
     }
-    $script:Others = $list
+    # Order = auto-switch priority, so the top one is "next up".
+    $script:Others = Sort-SwitchCandidates $list ([double]$Settings.AutoSwitchMinLeft)
+}
+
+# Returns $true if it switched accounts.
+function Invoke-AutoSwitch {
+    if (-not $Settings.AutoSwitch -or $script:LastErr -or -not $script:Rows) { return $false }
+    $used = Get-MaxUsed $script:Rows
+    if ($used -lt [double]$Settings.AutoSwitchAt) { $script:AutoNotified = $false; return $false }
+    if ((Get-Date) -lt $script:AutoCooldownUntil) { return $false }
+
+    if (-not $Settings.ShowAll) { Update-OtherAccounts }   # need fresh numbers to choose
+    $target = Select-AutoSwitchTarget $script:Others ([double]$Settings.AutoSwitchMinLeft)
+    if (-not $target) {
+        if (-not $script:AutoNotified) {
+            $tray.ShowBalloonTip(6000, 'Claude auto-switch',
+                ("Current account is at {0}% but no other account has {1}% left on every limit." -f [int]$used, $Settings.AutoSwitchMinLeft), 'Warning')
+            $script:AutoNotified = $true
+        }
+        return $false
+    }
+
+    $from = $script:ActiveName
+    try { Switch-ClaudeProfile $target.Id | Out-Null } catch {
+        $tray.ShowBalloonTip(6000, 'Claude auto-switch failed', $_.Exception.Message, 'Error'); return $false
+    }
+    $script:AutoCooldownUntil = (Get-Date).AddMinutes(5)   # no ping-ponging
+    $script:AutoNotified = $false
+    $tray.ShowBalloonTip(8000, 'Claude auto-switched account',
+        ("{0} reached {1}% used. Now using {2}. Restart running Claude Code sessions to pick it up." -f $from, [int]$used, $target.Name), 'Info')
+    Update-Usage
+    return $true
 }
 
 function Get-OverlayHeight {
-    $h = 30 + [math]::Max(1, @($script:Rows).Count) * 34
+    $h = 44 + [math]::Max(1, @($script:Rows).Count) * 34
     if ($Settings.ShowAll) {
-        $h += 12   # divider
+        $h += 6    # gap below the active panel
         if (-not $script:Others) { $h += 20 }
         foreach ($o in $script:Others) {
             $h += 20
@@ -234,6 +273,49 @@ $miRemain.CheckOnClick = $true
 $miRemain.Checked = [bool]$Settings.ShowRemaining
 $miRemain.Add_CheckedChanged({ $Settings.ShowRemaining = $miRemain.Checked; Save-Settings; Update-Ui })
 $menu.Items.Add('-') | Out-Null
+
+# Auto-switch submenu
+$miAuto = New-Object System.Windows.Forms.ToolStripMenuItem 'Auto-switch'
+$menu.Items.Add($miAuto) | Out-Null
+$miAutoOn = New-Object System.Windows.Forms.ToolStripMenuItem 'Enabled'
+$miAutoOn.CheckOnClick = $true
+$miAutoOn.Checked = [bool]$Settings.AutoSwitch
+$miAutoOn.Add_CheckedChanged({
+    $Settings.AutoSwitch = $miAutoOn.Checked; Save-Settings
+    $script:AutoCooldownUntil = [datetime]::MinValue
+    Update-Usage
+})
+$miAuto.DropDownItems.Add($miAutoOn) | Out-Null
+$miAuto.DropDownItems.Add('-') | Out-Null
+
+function Add-RadioGroup($parent, [string]$heading, [int[]]$values, [string]$fmt, [string]$key) {
+    $h = $parent.DropDownItems.Add($heading); $h.Enabled = $false
+    $items = @()
+    foreach ($v in $values) {
+        $it = New-Object System.Windows.Forms.ToolStripMenuItem ($fmt -f $v)
+        $it.Tag = @{ Key = $key; Value = $v }
+        $it.Checked = ([int]$Settings[$key] -eq $v)
+        $parent.DropDownItems.Add($it) | Out-Null
+        $items += $it
+    }
+    foreach ($it in $items) {
+        $it.Add_Click({
+            param($s, $e)
+            $Settings[$s.Tag.Key] = $s.Tag.Value; Save-Settings
+            foreach ($sib in $s.Owner.Items) {
+                if ($sib.Tag -is [hashtable] -and $sib.Tag.Key -eq $s.Tag.Key) { $sib.Checked = ($sib -eq $s) }
+            }
+            if ($s.Tag.Key -eq 'AutoSwitchMinLeft' -and $script:Others) {
+                $script:Others = Sort-SwitchCandidates $script:Others ([double]$Settings.AutoSwitchMinLeft)
+            }
+            Update-Ui
+        })
+    }
+}
+Add-RadioGroup $miAuto 'Switch when any limit reaches' @(90, 95, 99, 100) '   {0}% used' 'AutoSwitchAt'
+$miAuto.DropDownItems.Add('-') | Out-Null
+Add-RadioGroup $miAuto 'Only to accounts with at least' @(5, 10, 20, 30, 50) '   {0}% left on every limit' 'AutoSwitchMinLeft'
+
 $miAccount = New-Object System.Windows.Forms.ToolStripMenuItem 'Account'
 $menu.Items.Add($miAccount) | Out-Null
 $miAccount.DropDownItems.Add('(loading)') | Out-Null   # placeholder so the arrow shows
@@ -261,6 +343,8 @@ function Set-ShowAll([bool]$on) {
 function Invoke-SwitchAccount($id) {
     try {
         $p = Switch-ClaudeProfile $id
+        # Respect a manual choice: auto-switch won't override it for 5 minutes.
+        $script:AutoCooldownUntil = (Get-Date).AddMinutes(5)
         Update-Usage
         $tray.ShowBalloonTip(4000, 'Claude account switched', "Now using $($p.Name). Restart any running Claude Code sessions.", 'Info')
     } catch {
@@ -274,9 +358,12 @@ $miAccount.Add_DropDownOpening({
     try { Sync-ActiveProfile | Out-Null } catch {}
     $profiles = Get-ClaudeProfiles
     if (-not $profiles) { $x = $miAccount.DropDownItems.Add('(no saved accounts)'); $x.Enabled = $false }
-    foreach ($p in $profiles) {
-        $item = New-Object System.Windows.Forms.ToolStripMenuItem $p.Name
+    # Active account first, bold, marked.
+    foreach ($p in @($profiles | Sort-Object @{ e = { -not $_.Active } }, Name)) {
+        $label = if ($p.Active) { "$($p.Name)   (active)" } else { $p.Name }
+        $item = New-Object System.Windows.Forms.ToolStripMenuItem $label
         $item.Checked = $p.Active
+        if ($p.Active) { $item.Font = New-Object System.Drawing.Font($item.Font, [System.Drawing.FontStyle]::Bold) }
         $item.Tag = $p.Id
         $item.Add_Click({ param($s, $e) Invoke-SwitchAccount $s.Tag })
         $miAccount.DropDownItems.Add($item) | Out-Null
@@ -330,6 +417,9 @@ $fgDim   = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArg
 $trackBr = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(60, 60, 68))
 $btnBr   = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(55, 55, 64))
 $btnOnBr = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(70, 95, 160))
+$accentBr   = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(110, 155, 255))
+$activeBgBr = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(38, 42, 56))
+$fontTag    = New-Object System.Drawing.Font('Segoe UI', 6.75, [System.Drawing.FontStyle]::Bold)
 
 $overlay.Add_Paint({
     param($s, $e)
@@ -343,7 +433,12 @@ $overlay.Add_Paint({
     $cf = New-Object System.Drawing.StringFormat
     $cf.Alignment = 'Center'; $cf.LineAlignment = 'Center'
 
-    # Header: [account name ...] [time] [All] [+]
+    # ---- Active account block: always on top, tinted panel + accent stripe ----
+    $activeH = 44 + [math]::Max(1, @($script:Rows).Count) * 34 - 4
+    $g.FillRectangle($activeBgBr, 0, 0, $w, $activeH)
+    $g.FillRectangle($accentBr, 0, 0, 3, $activeH)
+
+    # Row 1: ACTIVE [AUTO] ... [time] [All] [+]
     $script:BtnAdd = New-Object System.Drawing.Rectangle(($w - 26), 5, 20, 17)
     $script:BtnAll = New-Object System.Drawing.Rectangle(($w - 56), 5, 27, 17)
     $allBg = if ($Settings.ShowAll) { $btnOnBr } else { $btnBr }
@@ -352,51 +447,71 @@ $overlay.Add_Paint({
     $g.FillRectangle($btnBr, $script:BtnAdd)
     $g.DrawString('+', $fontTitle, $fgMain, [System.Drawing.RectangleF]$script:BtnAdd, $cf)
 
+    $g.DrawString('ACTIVE', $fontTag, $accentBr, 10, 8)
+    if ($Settings.AutoSwitch) {
+        $tag = 'AUTO @ {0}%' -f $Settings.AutoSwitchAt
+        $g.DrawString($tag, $fontTag, $fgDim, 58, 8)
+    }
     $status = if ($script:LastErr) { 'stale' } elseif ($script:LastOk) { $script:LastOk.ToString('HH:mm') } else { '...' }
     $sz = $g.MeasureString($status, $fontSmall)
     $g.DrawString($status, $fontSmall, $fgDim, ($w - 60 - $sz.Width), 8)
 
+    # Row 2: account name, full width
     $title = if ($script:ActiveName) { $script:ActiveName } else { 'Claude usage' }
-    $g.DrawString($title, $fontTitle, $fgMain, (New-Object System.Drawing.RectangleF(10, 6, ($w - 72 - $sz.Width), 16)), $tf)
+    $g.DrawString($title, $fontTitle, $fgMain, (New-Object System.Drawing.RectangleF(10, 24, ($w - 18), 16)), $tf)
 
-    $y = 28
+    $y = 44
     if (-not $script:Rows) {
         $msg = if ($script:LastErr) { $script:LastErr } else { 'Loading...' }
-        $g.DrawString($msg, $fontSmall, $fgDim, (New-Object System.Drawing.RectangleF(10, 28, ($w - 20), 30)))
+        $g.DrawString($msg, $fontSmall, $fgDim, (New-Object System.Drawing.RectangleF(10, $y, ($w - 20), 30)))
         $y += 34
     }
-    foreach ($r in $script:Rows) { Draw-UsageRow $g $r $y $w 18; $y += 34 }
+    foreach ($r in $script:Rows) { Draw-UsageRow $g $r $y $w 18 $false; $y += 34 }
 
+    # ---- Other accounts: plain, dimmed, in auto-switch priority order ----
+    $script:SwitchRects = @()
     if ($Settings.ShowAll) {
-        $g.FillRectangle($trackBr, 10, ($y + 2), ($w - 20), 1)
-        $y += 10
+        $y += 6
         if (-not $script:Others) {
             $g.DrawString('No other saved accounts. Click + to add one.', $fontSmall, $fgDim, 10, $y)
         }
+        $first = $true
         foreach ($o in $script:Others) {
-            $g.DrawString($o.Name, $fontTitle, $fgDim, (New-Object System.Drawing.RectangleF(10, $y, ($w - 20), 16)), $tf)
+            $link = New-Object System.Drawing.Rectangle(($w - 50), $y, 42, 16)
+            $script:SwitchRects += @{ Rect = $link; Id = $o.Id }
+            $g.DrawString('Switch', $fontSmall, $accentBr, [System.Drawing.RectangleF]$link, $cf)
+            $nameW = $w - 64
+            if ($first -and $o.Eligible -and $Settings.AutoSwitch) {
+                $g.DrawString('NEXT', $fontTag, $accentBr, ($w - 82), ($y + 2))
+                $nameW = $w - 96
+            }
+            $g.DrawString($o.Name, $fontRow, $fgDim, (New-Object System.Drawing.RectangleF(10, $y, $nameW, 16)), $tf)
+            $first = $false
             $y += 20
             if ($o.Err) {
                 $g.DrawString($o.Err, $fontSmall, $fgDim, (New-Object System.Drawing.RectangleF(10, $y, ($w - 20), 28)))
                 $y += 30
             } else {
-                foreach ($r in $o.Rows) { Draw-UsageRow $g $r $y $w 16; $y += 30 }
+                foreach ($r in $o.Rows) { Draw-UsageRow $g $r $y $w 16 $true; $y += 30 }
             }
         }
     }
     $tf.Dispose(); $cf.Dispose()
 })
 
-function Draw-UsageRow($g, $r, [int]$y, [int]$w, [int]$barOffset) {
+function Draw-UsageRow($g, $r, [int]$y, [int]$w, [int]$barOffset, [bool]$dim) {
     $left = [math]::Max(0, [math]::Min(100, 100 - $r.Used))
     $fillPct = if ($Settings.ShowRemaining) { $left } else { 100 - $left }
-    $g.DrawString($r.Label, $fontRow, $fgMain, 10, $y)
+    $labelBr = if ($dim) { $fgDim } else { $fgMain }
+    $g.DrawString($r.Label, $fontRow, $labelBr, 10, $y)
     $right = '{0} - {1}' -f (Format-Pct $r), (Format-Until $r.Resets)
     $sz = $g.MeasureString($right, $fontSmall)
     $g.DrawString($right, $fontSmall, $fgDim, ($w - $sz.Width - 8), ($y + 1))
     $barW = $w - 20
     $g.FillRectangle($trackBr, 10, ($y + $barOffset), $barW, 6)
-    $fill = New-Object System.Drawing.SolidBrush (Get-LevelColor $left)
+    $c = Get-LevelColor $left
+    if ($dim) { $c = [System.Drawing.Color]::FromArgb(140, $c) }
+    $fill = New-Object System.Drawing.SolidBrush $c
     $g.FillRectangle($fill, 10, ($y + $barOffset), [float]($barW * $fillPct / 100), 6)
     $fill.Dispose()
 }
@@ -407,6 +522,9 @@ $overlay.Add_MouseDown({
     if ($e.Button -eq 'Left') {
         if ($script:BtnAll.Contains($e.Location)) { Set-ShowAll (-not $Settings.ShowAll); return }
         if ($script:BtnAdd.Contains($e.Location)) { Start-AddAccount; return }
+        foreach ($sr in $script:SwitchRects) {
+            if ($sr.Rect.Contains($e.Location)) { Invoke-SwitchAccount $sr.Id; return }
+        }
         [Native.Win32]::ReleaseCapture() | Out-Null
         [Native.Win32]::SendMessage($overlay.Handle, 0xA1, 0x2, 0) | Out-Null   # WM_NCLBUTTONDOWN, HTCAPTION
         $Settings.X = $overlay.Left; $Settings.Y = $overlay.Top

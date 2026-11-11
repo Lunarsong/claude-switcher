@@ -26,9 +26,24 @@ Click **+** on the overlay, choose **Account → Add account (without switching)
 
 Click **All** on the overlay (or **Show all accounts** in the menu) to list usage for every saved account under the active one. You can also run `claude-profile usage` in a terminal. Inactive accounts use their saved tokens. When a saved access token expires, it's refreshed through the same OAuth endpoint Claude Code uses, and the new tokens are written straight back to that profile. The active account's tokens are never refreshed here; Claude Code owns those.
 
+### Auto-switch
+
+**Tray → Auto-switch → Enabled** (off by default) switches accounts for you when the active account runs out:
+
+- **Switch when any limit reaches:** 90 / 95 / **99** / 100 % used. This covers the session, weekly and per-model limits.
+- **Only to accounts with at least:** 5 / **10** / 20 / 30 / 50 % left on *every* limit. An account with a fresh weekly limit but a maxed-out session is skipped.
+- **Priority:** among eligible accounts, the one whose weekly limit **resets soonest** wins, so that allowance gets used before it expires. Ties go to the account with the most headroom.
+- If no account qualifies, you get a single warning, and it doesn't repeat until usage drops and rises again.
+- After any switch, auto or manual, auto-switch waits 5 minutes, so it never ping-pongs and doesn't override a choice you just made.
+- Usage is checked every 2 minutes, so a fast session can pass the threshold before the switch happens.
+
+With **All** on, other accounts are listed in auto-switch priority order. The one it would pick is tagged **NEXT**.
+
+**Running Claude Code sessions keep the old login until restarted**, so an auto-switch helps the next session you start, not one already in progress.
+
 ### Switching
 
-**Tray → Account** lists your saved accounts; click one to switch. The same submenu has rename and "open profiles folder". From the CLI:
+In the overlay, the active account is always at the top: a tinted panel with a blue stripe and an **ACTIVE** label. Other accounts are dimmed below it, each with a **Switch** link. **Tray → Account** lists the active account first, in bold and marked "(active)"; click any other to switch. The same submenu has rename and "open profiles folder". From the CLI:
 
 ```
 claude-profile                  list (* = active)

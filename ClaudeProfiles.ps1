@@ -149,6 +149,43 @@ function Get-ProfileAccessToken($P) {
     return $o['accessToken']
 }
 
+# ---------- auto-switch selection ----------
+function Get-MaxUsed($Rows) {
+    $m = 0.0
+    foreach ($r in @($Rows)) { if ($r.Used -gt $m) { $m = [double]$r.Used } }
+    return $m
+}
+
+# Soonest weekly reset (fallback: soonest of any limit). Accounts whose weekly
+# allowance resets soonest are used first, so that allowance isn't wasted.
+function Get-PriorityReset($Rows) {
+    $weekly = @($Rows | Where-Object { $_.Label -like 'Weekly*' -and $_.Resets -is [datetime] })
+    $pool = if ($weekly) { $weekly } else { @($Rows | Where-Object { $_.Resets -is [datetime] }) }
+    if (-not $pool) { return [datetime]::MaxValue }
+    return ($pool | ForEach-Object { $_.Resets.ToUniversalTime() } | Sort-Object | Select-Object -First 1)
+}
+
+# Others ordered for switching: eligible accounts (every limit <= 100-MinLeft used)
+# first, soonest reset first, then most headroom; ineligible/errored after.
+# Each entry gets .Eligible set.
+function Sort-SwitchCandidates($Others, [double]$MinLeft) {
+    $limit = 100 - $MinLeft
+    foreach ($o in @($Others)) {
+        $o.Eligible = (-not $o.Err) -and @($o.Rows).Count -gt 0 -and ((Get-MaxUsed $o.Rows) -le $limit)
+    }
+    $eligible = @($Others | Where-Object { $_.Eligible } | Sort-Object @{ e = { Get-PriorityReset $_.Rows } }, @{ e = { Get-MaxUsed $_.Rows } })
+    $rest     = @($Others | Where-Object { -not $_.Eligible })
+    return ,@($eligible + $rest)
+}
+
+# The account to switch to, or $null. Does not check whether a switch is due.
+function Select-AutoSwitchTarget($Others, [double]$MinLeft) {
+    $sorted = Sort-SwitchCandidates $Others $MinLeft
+    $first = $sorted | Select-Object -First 1
+    if ($first -and $first.Eligible) { return $first }
+    return $null
+}
+
 function ConvertFrom-UsageDate($s) {
     if (-not $s) { return $null }
     try { return [datetime]::Parse($s, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind) } catch { return $null }

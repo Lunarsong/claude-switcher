@@ -11,6 +11,11 @@
 #>
 param([string]$Command = 'list', [Parameter(ValueFromRemainingArguments)][string[]]$Rest)
 $ErrorActionPreference = 'Stop'
+# The profile code uses .NET Framework's JSON serializer; re-run under Windows PowerShell if started from pwsh 7.
+if ($PSVersionTable.PSEdition -eq 'Core') {
+    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $PSCommandPath $Command @Rest
+    exit $LASTEXITCODE
+}
 . (Join-Path $PSScriptRoot 'ClaudeProfiles.ps1')
 
 function Show-List {
