@@ -68,7 +68,7 @@ struct PopoverView: View {
                 Text(m.statusMessage).font(.system(size: 11)).foregroundColor(.secondary).lineLimit(3)
                     .padding(.vertical, 4)
             }
-            ForEach(Array(m.rows.enumerated()), id: \.offset) { _, r in
+            ForEach(Array(displayRows(m.rows).enumerated()), id: \.offset) { _, r in
                 UsageRowView(row: r, showRemaining: m.settings.showRemaining, dim: false)
             }
         }
@@ -110,7 +110,7 @@ struct PopoverView: View {
                         Text(o.pending && m.paused ? "Not checked yet – rate limited, retrying at \(AppController.hhmm.string(from: m.backoffUntil))" : e)
                             .font(.system(size: 11)).foregroundColor(.secondary).lineLimit(2)
                     } else {
-                        ForEach(Array(o.rows.enumerated()), id: \.offset) { _, r in
+                        ForEach(Array(displayRows(o.rows).enumerated()), id: \.offset) { _, r in
                             UsageRowView(row: r, showRemaining: m.settings.showRemaining, dim: true)
                         }
                     }

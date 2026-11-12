@@ -445,13 +445,13 @@ function Invoke-AutoSwitch([bool]$OthersFresh) {
 }
 
 function Get-OverlayHeight {
-    $h = $script:HeaderH + [math]::Max(1, @($script:Rows).Count) * 34
+    $h = $script:HeaderH + [math]::Max(1, @(Get-DisplayRows $script:Rows).Count) * 34
     if ($Settings.ShowAll) {
         $h += 6    # gap below the active panel
         if (-not $script:Others) { $h += 20 }
         foreach ($o in $script:Others) {
             $h += 20
-            $h += if ($o.Err) { 30 } else { @($o.Rows).Count * 30 }
+            $h += if ($o.Err) { 30 } else { @(Get-DisplayRows $o.Rows).Count * 30 }
         }
         $h += 4
     }
@@ -509,8 +509,8 @@ function Update-Ui {
 
     # Tooltip: Windows (.NET Framework) allows at most 63 characters.
     if ($script:Rows) {
-        $parts = foreach ($r in $script:Rows) {
-            $lbl = $r.Label -replace '^Session \(5h\)$', '5h' -replace '^Weekly$', 'Wk' -replace '^Weekly ', ''
+        $parts = foreach ($r in (Get-DisplayRows $script:Rows)) {
+            $lbl = $r.Label -replace '^Weekly - used up$', 'Wk' -replace '^Session \(5h\)$', '5h' -replace '^Weekly$', 'Wk' -replace '^Weekly ', ''
             $pct = if ($Settings.ShowRemaining) { 100 - $r.Used } else { $r.Used }
             '{0} {1}%' -f $lbl, [int][math]::Max(0, [math]::Min(100, $pct))
         }
@@ -759,7 +759,8 @@ $overlay.Add_Paint({
 
     # ---- Active account block: always on top, tinted panel + accent stripe ----
     $headerH = $script:HeaderH
-    $activeH = $headerH + [math]::Max(1, @($script:Rows).Count) * 34 - 4
+    $activeRows = Get-DisplayRows $script:Rows
+    $activeH = $headerH + [math]::Max(1, @($activeRows).Count) * 34 - 4
     $g.FillRectangle($activeBgBr, 0, 0, $w, $activeH)
     $g.FillRectangle($accentBr, 0, 0, 3, $activeH)
 
@@ -797,7 +798,7 @@ $overlay.Add_Paint({
         $g.DrawString((Get-StatusMessage), $fontSmall, $fgDim, (New-Object System.Drawing.RectangleF(10, $y, ($w - 20), 28)), $ef)
         $y += 34
     }
-    foreach ($r in $script:Rows) { Draw-UsageRow $g $r $y $w 18 $false; $y += 34 }
+    foreach ($r in $activeRows) { Draw-UsageRow $g $r $y $w 18 $false; $y += 34 }
 
     # ---- Other accounts: plain, dimmed, in auto-switch priority order ----
     $script:SwitchRects = @()
@@ -830,7 +831,7 @@ $overlay.Add_Paint({
                 $g.DrawString($o.Err, $fontSmall, $fgDim, (New-Object System.Drawing.RectangleF(10, $y, ($w - 20), 26)), $ef)
                 $y += 30
             } else {
-                foreach ($r in $o.Rows) { Draw-UsageRow $g $r $y $w 16 $true; $y += 30 }
+                foreach ($r in (Get-DisplayRows $o.Rows)) { Draw-UsageRow $g $r $y $w 16 $true; $y += 30 }
             }
         }
     }

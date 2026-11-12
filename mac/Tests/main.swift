@@ -509,6 +509,14 @@ test("\"most room\" preference picks the emptiest account") {
 test("a weekly minimum excludes the nearly-spent account") {
     try assertEqual("B", selectAutoSwitchTarget(others(), SwitchRules(fullAt: 99, minSession: 10, minWeekly: 5))?.id, "pick")
 }
+test("a spent weekly limit collapses the display to one row") {
+    let full = [row("Session (5h)", 40, 3), row("Weekly", 100, 30), row("Weekly Fable", 80, 30)]
+    let d = displayRows(full)
+    try assertEqual(1, d.count, "rows shown")
+    try assertEqual("Weekly – used up", d[0].label, "label")
+    try assertEqual(full[1].resets, d[0].resets, "reset time kept")
+    try assertEqual(3, displayRows([row("Session (5h)", 40, 3), row("Weekly", 99, 30), row("Weekly Fable", 100, 30)]).count, "only a model limit spent")
+}
 test("no session minimum lets a low-session account qualify, still never a full one") {
     let s = sortSwitchCandidates(others(), SwitchRules(fullAt: 99, minSession: 0, minWeekly: 0))
     try assertEqual("A,D,B", s.filter(\.eligible).map(\.id).joined(separator: ","), "eligible order")

@@ -247,6 +247,15 @@ function Get-MaxUsed($Rows) {
     return $m
 }
 
+# Rows to draw. Once the all-models weekly limit is spent, the session and
+# per-model limits don't matter until it resets, so only that row is shown.
+# Display only: auto-switch and notifications still use every row.
+function Get-DisplayRows($Rows) {
+    $wk = @($Rows | Where-Object { $_.Label -eq 'Weekly' -and [double]$_.Used -ge 100 })
+    if ($wk) { return @{ Label = 'Weekly - used up'; Used = $wk[0].Used; Resets = $wk[0].Resets } }
+    return $Rows
+}
+
 # Soonest weekly reset (fallback: soonest of any limit). Accounts whose weekly
 # allowance resets soonest are used first, so that allowance isn't wasted.
 function Get-PriorityReset($Rows) {

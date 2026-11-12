@@ -214,6 +214,14 @@ Test '"most room" preference picks the emptiest account' {
 Test 'a weekly minimum excludes the nearly-spent account' {
     Assert-Equal 'B' (Select-AutoSwitchTarget (Others) (New-SwitchRules 99 10 5)).Id 'pick'
 }
+Test 'a spent weekly limit collapses the display to one row' {
+    $full = @((Row 'Session (5h)' 40 3), (Row 'Weekly' 100 30), (Row 'Weekly Fable' 80 30))
+    $d = @(Get-DisplayRows $full)
+    Assert-Equal 1 @($d).Count 'rows shown'
+    Assert-Equal 'Weekly - used up' $d[0].Label 'label'
+    Assert-Equal $full[1].Resets $d[0].Resets 'reset time kept'
+    Assert-Equal 3 @(Get-DisplayRows @((Row 'Session (5h)' 40 3), (Row 'Weekly' 99 30), (Row 'Weekly Fable' 100 30))).Count 'only a model limit spent'
+}
 Test 'no session minimum lets a low-session account qualify, still never a full one' {
     $s = Sort-SwitchCandidates (Others) (New-SwitchRules 99 0 0)
     $ids = (@($s | Where-Object Eligible) | ForEach-Object { $_.Id }) -join ','

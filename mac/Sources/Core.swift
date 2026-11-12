@@ -769,6 +769,16 @@ func usageNotices(_ rows: [UsageRow], state: inout [String: NoticeState], warnAt
 
 func maxUsed(_ rows: [UsageRow]) -> Double { rows.map(\.used).max().map { max(0, $0) } ?? 0 }
 
+/// Rows to draw. Once the all-models weekly limit is spent, the session and
+/// per-model limits don't matter until it resets, so only that row is shown.
+/// Display only: auto-switch and notifications still use every row.
+func displayRows(_ rows: [UsageRow]) -> [UsageRow] {
+    if let wk = rows.first(where: { $0.label == "Weekly" && $0.used >= 100 }) {
+        return [UsageRow(label: "Weekly – used up", used: wk.used, resets: wk.resets)]
+    }
+    return rows
+}
+
 /// Soonest weekly reset (fallback: soonest of any limit). Accounts whose weekly
 /// allowance resets soonest are used first, so that allowance isn't wasted.
 func priorityReset(_ rows: [UsageRow]) -> Date {
