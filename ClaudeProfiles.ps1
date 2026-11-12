@@ -67,8 +67,13 @@ function Get-ActiveAccount {
     $acct = (Read-ClaudeConfig)['oauthAccount']
     if (-not $acct) { return $null }
     $configId = '{0}_{1}' -f $acct['accountUuid'], $acct['organizationUuid']
-    $token = $null
-    try { $token = ((New-JsonSerializer).DeserializeObject([IO.File]::ReadAllText($script:CredFile)))['claudeAiOauth']['accessToken'] } catch {}
+    # Read the credentials once; CredText is exactly what was verified, so callers
+    # never save a file that changed after the check (e.g. a switch in between).
+    $credText = $null; $token = $null
+    try {
+        $credText = [IO.File]::ReadAllText($script:CredFile)
+        $token = ((New-JsonSerializer).DeserializeObject($credText))['claudeAiOauth']['accessToken']
+    } catch {}
     $tokenId = Get-TokenIdentity $token
     return [pscustomobject]@{
         Id       = if ($tokenId) { $tokenId } else { $configId }
@@ -78,6 +83,7 @@ function Get-ActiveAccount {
         Email    = $acct['emailAddress']
         Org      = $acct['organizationName']
         Account  = $acct
+        CredText = $credText
     }
 }
 
@@ -133,8 +139,8 @@ function Save-ProfileSnapshot([string]$CredText, $Account, [string]$Name) {
 # account's login can never be stored under another account's profile.
 function Sync-ActiveProfile([string]$Name, $Active = $null) {
     $active = if ($Active) { $Active } else { Get-ActiveAccount }
-    if (-not $active -or -not $active.Verified) { return $null }
-    $cred = [IO.File]::ReadAllText($script:CredFile)
+    if (-not $active -or -not $active.Verified -or -not $active.CredText) { return $null }
+    $cred = $active.CredText
     if (-not $active.Mismatch) { return Save-ProfileSnapshot $cred $active.Account $Name }
 
     # Tokens belong to a different account than .claude.json says. If we know
@@ -226,6 +232,7 @@ function New-SwitchRules($FullAt = 99, $MinSession = 10, $MinWeekly = 0, $Prefer
 
 # Why an account can't be switched to, or $null if it can.
 function Get-IneligibleReason($o, $Rules) {
+    if ($o.Pending) { return 'NOT CHECKED' }
     if ($o.Err) { return 'ERROR' }
     if (-not @($o.Rows).Count) { return 'NO DATA' }
     foreach ($r in $o.Rows) {

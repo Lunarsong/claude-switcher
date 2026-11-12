@@ -120,29 +120,147 @@ function Parse-Date($s) {
     try { return [datetime]::Parse($s, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind) } catch { return $null }
 }
 
+# ---------- rate-limit backoff (persisted, so restarting doesn't reset it) ----------
+$StatePath = Join-Path $SettingsDir 'state.json'
+try {
+    if (Test-Path $StatePath) {
+        $st = Get-Content $StatePath -Raw | ConvertFrom-Json
+        $script:BackoffSec   = [int]$st.BackoffSec
+        $script:BackoffUntil = [datetime]::Parse($st.BackoffUntil, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind).ToLocalTime()
+    }
+} catch {}
+function Save-State {
+    try {
+        @{ BackoffSec = $script:BackoffSec; BackoffUntil = $script:BackoffUntil.ToUniversalTime().ToString('o') } |
+            ConvertTo-Json | Set-Content $StatePath -Encoding UTF8
+    } catch {}
+}
 function Start-Backoff([int]$retryAfter) {
     $next = if ($script:BackoffSec -gt 0) { $script:BackoffSec * 2 } else { 120 }
     $script:BackoffSec = [math]::Min(900, [math]::Max($retryAfter, $next))
     $script:BackoffUntil = (Get-Date).AddSeconds($script:BackoffSec)
-    $script:LastErr = 'Rate limited - retrying at {0}' -f $script:BackoffUntil.ToString('HH:mm')
+    Save-State
+}
+function Clear-Backoff {
+    if ($script:BackoffSec -ne 0) { $script:BackoffSec = 0; Save-State }
+}
+function Get-BackoffMessage { 'Rate limited - retrying at {0}' -f $script:BackoffUntil.ToString('HH:mm') }
+function Test-Paused { (Get-Date) -lt $script:BackoffUntil }
+function Test-Stale  { [bool]($script:LastErr -or (Test-Paused)) }
+# What to say when there are no numbers to show.
+function Get-StatusMessage {
+    if (Test-Paused) { return (Get-BackoffMessage) }
+    if ($script:LastErr) { return $script:LastErr }
+    return 'Loading...'
 }
 
-# -Full also refreshes the other accounts now instead of on their own schedule.
-function Update-Usage([switch]$Full) {
-    # Rate limited: don't touch the network until the backoff ends.
-    if ((Get-Date) -lt $script:BackoffUntil) { Update-Ui; return }
-    # Keep the active account's profile snapshot current (tokens rotate on refresh).
-    # Identity comes from the tokens themselves (checked with Anthropic), not
-    # just .claude.json - see Get-ActiveAccount.
+# ---------- background worker ----------
+# All network calls run in a separate runspace so the overlay never freezes.
+# One request at a time; the UI thread applies results and makes all decisions.
+$script:WorkerRs = [runspacefactory]::CreateRunspace()
+$script:WorkerRs.Open()
+$init = [powershell]::Create(); $init.Runspace = $script:WorkerRs
+$init.AddScript(". '$((Join-Path $PSScriptRoot 'ClaudeProfiles.ps1') -replace "'", "''")'").Invoke() | Out-Null
+$init.Dispose()
+
+$FetchScript = {
+    param([bool]$WantOthers, [string]$CredPath)
+    $out = @{ Acct = $null; Profiles = @(); Rows = $null; Err = $null
+              RateLimited = $false; RetryAfter = 0; Others = $null; OthersRateLimited = $false }
     try {
+        # Identity comes from the tokens themselves (checked with Anthropic) - see Get-ActiveAccount.
         $acct = Get-ActiveAccount
-        Sync-ActiveProfile $null $acct | Out-Null
-        $profiles = Get-ClaudeProfiles $acct
-        $script:ActiveName = ($profiles | Where-Object Active | Select-Object -First 1).Name
-        $script:Mismatch = [bool]($acct -and $acct.Mismatch)
+        Sync-ActiveProfile $null $acct | Out-Null   # keep the active profile's tokens current
+        $out.Acct = $acct
+        $out.Profiles = @(Get-ClaudeProfiles $acct)
+    } catch {}
+    try {
+        if (-not (Test-Path $CredPath)) { throw "No Claude Code login found. Run 'claude' and log in." }
+        $token = ((New-JsonSerializer).DeserializeObject([IO.File]::ReadAllText($CredPath)))['claudeAiOauth']['accessToken']
+        if (-not $token) { throw "No login token found. Run 'claude' and log in." }
+        $out.Rows = Get-UsageRows $token
+    } catch {
+        if ($_.Exception.Data['RateLimited']) {
+            $out.RateLimited = $true; $out.RetryAfter = [int]$_.Exception.Data['RetryAfter']
+            return $out
+        }
+        $out.Err = $_.Exception.Message
+    }
+    if ($WantOthers) {
+        $list = @()
+        foreach ($p in ($out.Profiles | Where-Object { -not $_.Active })) {
+            $entry = @{ Id = $p.Id; Name = $p.Name; Rows = @(); Err = $null; Eligible = $false; Reason = $null }
+            try { $entry.Rows = Get-UsageRows (Get-ProfileAccessToken $p) } catch {
+                if ($_.Exception.Data['RateLimited']) {
+                    $out.OthersRateLimited = $true; $out.RetryAfter = [int]$_.Exception.Data['RetryAfter']
+                    break
+                }
+                $entry.Err = $_.Exception.Message
+            }
+            $list += $entry
+        }
+        if (-not $out.OthersRateLimited) { $out.Others = $list }
+    }
+    return $out
+}
+
+$script:Job          = $null    # @{ PS; Handle; WantOthers }
+$script:QueuedOthers = $null    # $null = nothing queued, else [bool] whether others are wanted
+$script:LastAcct     = $null    # last Get-ActiveAccount result from the worker
+
+function Test-OthersDue {
+    ((Get-Date) - $script:OthersFetchedAt).TotalMinutes -ge [double]$Settings.OthersIntervalMin
+}
+
+# Ask for fresh numbers. -Full also re-checks other accounts now.
+function Update-Usage([switch]$Full) {
+    $wantOthers = [bool]($Settings.ShowAll -and ($Full -or (Test-OthersDue)))
+    if ($Full -and $Settings.AutoSwitch) { $wantOthers = $true }
+    Request-Refresh $wantOthers
+}
+
+function Request-Refresh([bool]$WantOthers) {
+    if ((Get-Date) -lt $script:BackoffUntil) { Update-Ui; return }   # rate limited: stay off the network
+    if ($script:Job) {
+        # Busy: remember to run again afterwards (merging "others" requests).
+        $script:QueuedOthers = [bool]($WantOthers -or $script:QueuedOthers)
+        return
+    }
+    $ps = [powershell]::Create(); $ps.Runspace = $script:WorkerRs
+    $ps.AddScript($FetchScript).AddArgument($WantOthers).AddArgument($CredPath) | Out-Null
+    $script:Job = @{ PS = $ps; Handle = $ps.BeginInvoke(); WantOthers = $WantOthers }
+    $jobWatch.Start()
+}
+
+# Runs on the UI thread when the worker finishes.
+function Complete-Refresh {
+    $job = $script:Job
+    $r = $null
+    try {
+        $res = $job.PS.EndInvoke($job.Handle)
+        if ($res -and $res.Count) { $r = $res[0] }
+    } catch {
+        $script:LastErr = $_.Exception.Message
+    } finally {
+        $job.PS.Dispose()
+        $script:Job = $null
+    }
+    if ($r) { Apply-Result $r }
+
+    if ($null -ne $script:QueuedOthers) {
+        $q = $script:QueuedOthers; $script:QueuedOthers = $null
+        Request-Refresh $q
+    }
+}
+
+function Apply-Result($r) {
+    if ($r.Acct) {
+        $script:LastAcct = $r.Acct
+        $script:ActiveName = ($r.Profiles | Where-Object Active | Select-Object -First 1).Name
+        $script:Mismatch = [bool]$r.Acct.Mismatch
         if ($script:Mismatch) {
-            $cfgName = ($profiles | Where-Object Id -eq $acct.ConfigId | Select-Object -First 1).Name
-            if (-not $cfgName) { $cfgName = $acct.Email }
+            $cfgName = ($r.Profiles | Where-Object Id -eq $r.Acct.ConfigId | Select-Object -First 1).Name
+            if (-not $cfgName) { $cfgName = $r.Acct.Email }
             if (-not $script:ActiveName) { $script:ActiveName = 'Unknown account' }
             if (-not $script:MismatchNotified) {
                 $tray.ShowBalloonTip(10000, 'Claude login was overwritten',
@@ -151,66 +269,58 @@ function Update-Usage([switch]$Full) {
             }
         } else { $script:MismatchNotified = $false }
         $script:ProfSig = Get-ProfilesSignature
-    } catch {}
-    try {
-        if (-not (Test-Path $CredPath)) { throw "No Claude Code login found ($CredPath). Run 'claude' and log in." }
-        $cred = (Get-Content $CredPath -Raw | ConvertFrom-Json).claudeAiOauth
-        if (-not $cred.accessToken) { throw 'No OAuth token in credentials file. Run ''claude'' and log in.' }
-
-        $script:Rows    = Get-UsageRows $cred.accessToken
-        $script:LastErr = $null
-        $script:LastOk  = Get-Date
-        $script:BackoffSec = 0
-    } catch {
-        if ($_.Exception.Data['RateLimited']) {
-            # Keep showing the last numbers; wait (server hint, else doubling from 2 min, max 15 min).
-            Start-Backoff ([int]$_.Exception.Data['RetryAfter'])
-            Update-Ui
-            return
-        }
-        $script:LastErr = $_.Exception.Message
     }
-    # Other accounts change only when you use them, so they're checked on a slower
-    # schedule (and only while "All" is on). Auto-switch always re-checks them first.
-    $othersDue = ((Get-Date) - $script:OthersFetchedAt).TotalMinutes -ge [double]$Settings.OthersIntervalMin
-    if ($Settings.ShowAll -and ($Full -or $othersDue)) { Update-OtherAccounts }
-    if (Invoke-AutoSwitch) { return }   # switched: it already refreshed everything
+
+    if ($r.RateLimited) {
+        # Keep showing the last numbers; wait (server hint, else doubling from 2 min, max 15 min).
+        Start-Backoff $r.RetryAfter
+        Set-OtherPlaceholders $r.Profiles
+        Update-Ui
+        return
+    }
+    if ($r.Err) { $script:LastErr = $r.Err } else {
+        $script:Rows = $r.Rows; $script:LastErr = $null; $script:LastOk = Get-Date
+        Clear-Backoff
+    }
+
+    $othersFresh = $false
+    if ($null -ne $r.Others) {
+        $script:Others = Sort-SwitchCandidates @($r.Others) (Get-SwitchRules)
+        $script:OthersFetchedAt = Get-Date
+        $othersFresh = $true
+    } elseif ($r.OthersRateLimited) {
+        Start-Backoff $r.RetryAfter     # keep previous numbers; OthersFetchedAt untouched so they're retried
+    }
+    Set-OtherPlaceholders $r.Profiles
+
+    Invoke-AutoSwitch $othersFresh
     Update-Ui
 }
 
-# Usage for every saved account except the active one.
-function Update-OtherAccounts {
-    $script:OthersFetchedAt = Get-Date
-    $list = @()
-    foreach ($p in (Get-ClaudeProfiles | Where-Object { -not $_.Active })) {
-        $entry = @{ Id = $p.Id; Name = $p.Name; Rows = @(); Err = $null; Eligible = $false }
-        try { $entry.Rows = Get-UsageRows (Get-ProfileAccessToken $p) } catch {
-            if ($_.Exception.Data['RateLimited']) {
-                # Keep the previous numbers for everyone and stop asking.
-                Start-Backoff ([int]$_.Exception.Data['RetryAfter'])
-                return
-            }
-            $entry.Err = $_.Exception.Message
-        }
-        $list += $entry
+# Saved accounts we haven't been able to check yet still get listed (by name),
+# and accounts that were removed disappear.
+function Set-OtherPlaceholders($profiles) {
+    $inactive = @($profiles | Where-Object { -not $_.Active })
+    if (-not $inactive) { if ($profiles) { $script:Others = @() }; return }
+    $byId = @{}; foreach ($o in @($script:Others)) { $byId[$o.Id] = $o }
+    $list = foreach ($p in $inactive) {
+        if ($byId.ContainsKey($p.Id)) { $o = $byId[$p.Id]; $o.Name = $p.Name; $o; continue }   # keep numbers, pick up renames
+        @{ Id = $p.Id; Name = $p.Name; Rows = @(); Err = 'Not checked yet'; Pending = $true; Eligible = $false; Reason = $null }
     }
-    # Order = auto-switch priority, so the top one is "next up".
-    $script:Others = Sort-SwitchCandidates $list (Get-SwitchRules)
+    $script:Others = Sort-SwitchCandidates @($list) (Get-SwitchRules)
 }
 
-# Returns $true if it switched accounts.
-function Invoke-AutoSwitch {
-    if (-not $Settings.AutoSwitch -or $script:LastErr -or -not $script:Rows) { return $false }
-    if ($script:Mismatch) { return $false }   # login files disagree: don't make it worse
+# Decides on the UI thread; asks the worker for fresh numbers when it needs them.
+function Invoke-AutoSwitch([bool]$OthersFresh) {
+    if (-not $Settings.AutoSwitch -or $script:LastErr -or -not $script:Rows) { return }
+    if ($script:Mismatch) { return }   # login files disagree: don't make it worse
     $used = Get-MaxUsed $script:Rows
-    if ($used -lt [double]$Settings.AutoSwitchAt) { $script:AutoNotified = $false; return $false }
-    if ((Get-Date) -lt $script:AutoCooldownUntil) { return $false }
+    if ($used -lt [double]$Settings.AutoSwitchAt) { $script:AutoNotified = $false; return }
+    if ((Get-Date) -lt $script:AutoCooldownUntil) { return }
 
     # Choose from fresh numbers. If we already found nobody qualifies, don't
     # re-check every account each minute - wait for their normal schedule.
-    $othersDue = ((Get-Date) - $script:OthersFetchedAt).TotalMinutes -ge [double]$Settings.OthersIntervalMin
-    if (-not $script:AutoNotified -or $othersDue) { Update-OtherAccounts }
-    if ((Get-Date) -lt $script:BackoffUntil) { return $false }   # rate limited mid-check: numbers may be stale
+    if (-not $OthersFresh -and (-not $script:AutoNotified -or (Test-OthersDue))) { Request-Refresh $true; return }
     $target = Select-AutoSwitchTarget $script:Others (Get-SwitchRules)
     if (-not $target) {
         if (-not $script:AutoNotified) {
@@ -220,12 +330,12 @@ function Invoke-AutoSwitch {
                 ("Current account is at {0}% but no other account qualifies ({1})." -f [int]$used, $why), 'Warning')
             $script:AutoNotified = $true
         }
-        return $false
+        return
     }
 
     $from = $script:ActiveName
     try { Switch-ClaudeProfile $target.Id | Out-Null } catch {
-        $tray.ShowBalloonTip(6000, 'Claude auto-switch failed', $_.Exception.Message, 'Error'); return $false
+        $tray.ShowBalloonTip(6000, 'Claude auto-switch failed', $_.Exception.Message, 'Error'); return
     }
     # Targets are never "full", so ping-pong can't happen; a short guard just
     # covers stale numbers. Kept short so a nearly-spent account can hand off fast.
@@ -233,8 +343,7 @@ function Invoke-AutoSwitch {
     $script:AutoNotified = $false
     $tray.ShowBalloonTip(8000, 'Claude auto-switched account',
         ("{0} reached {1}% used. Now using {2}. Restart running Claude Code sessions to pick it up." -f $from, [int]$used, $target.Name), 'Info')
-    Update-Usage -Full
-    return $true
+    Request-Refresh $true
 }
 
 function Get-OverlayHeight {
@@ -265,14 +374,16 @@ function New-TrayIcon {
     $g.Clear([System.Drawing.Color]::Transparent)
 
     $t = Get-Tightest
-    if ($script:LastErr -and -not $t) {
-        $bg = [System.Drawing.Color]::FromArgb(110, 110, 110); $text = '!'
+    if (-not $t) {
+        # No numbers yet: grey "!" on error/rate limit, grey "-" while loading.
+        $bg = [System.Drawing.Color]::FromArgb(110, 110, 110)
+        $text = if (Test-Stale) { '!' } else { '-' }
     } else {
         $left = [math]::Max(0, 100 - $t.Used)
         $bg = Get-LevelColor $left
         $shown = if ($Settings.ShowRemaining) { $left } else { [math]::Min(100, $t.Used) }
         $text = if ($shown -ge 100) { if ($Settings.ShowRemaining) { '99' } else { '!' } } else { [string][int][math]::Floor($shown) }
-        if ($script:LastErr) { $bg = [System.Drawing.Color]::FromArgb(110, 110, 110) }  # stale
+        if (Test-Stale) { $bg = [System.Drawing.Color]::FromArgb(110, 110, 110) }  # stale
     }
 
     $brush = New-Object System.Drawing.SolidBrush $bg
@@ -307,9 +418,9 @@ function Update-Ui {
         }
         $kind = if ($Settings.ShowRemaining) { 'left' } else { 'used' }
         $tip = "Claude ${kind}: " + ($parts -join ', ')
-        if ($script:LastErr) { $tip = '(stale) ' + $tip }
+        if (Test-Stale) { $tip = '(stale) ' + $tip }
     } else {
-        $tip = 'Claude: ' + $script:LastErr
+        $tip = 'Claude: ' + (Get-StatusMessage)
     }
     if ($tip.Length -gt 63) { $tip = $tip.Substring(0, 60) + '...' }
     $tray.Text = $tip
@@ -418,7 +529,11 @@ function Set-ShowAll([bool]$on) {
     $Settings.ShowAll = $on
     $miShowAll.Checked = $on
     Save-Settings
-    if ($on) { Update-OtherAccounts } else { $script:Others = @() }
+    if ($on) {
+        # List saved accounts by name straight away, then fetch their numbers.
+        Set-OtherPlaceholders (Get-ClaudeProfiles (Get-KnownActive))
+        Request-Refresh $true
+    } else { $script:Others = @() }
     Update-Ui
 }
 
@@ -427,7 +542,10 @@ function Invoke-SwitchAccount($id) {
         $p = Switch-ClaudeProfile $id
         # Respect a manual choice: auto-switch won't override it for 5 minutes.
         $script:AutoCooldownUntil = (Get-Date).AddMinutes(5)
-        Update-Usage
+        $script:ActiveName = $p.Name    # show it right away; numbers follow from the worker
+        $script:Rows = @(); $script:LastAcct = $null
+        Update-Usage -Full
+        Update-Ui
         $tray.ShowBalloonTip(4000, 'Claude account switched', "Now using $($p.Name). Restart any running Claude Code sessions.", 'Info')
     } catch {
         $tray.ShowBalloonTip(5000, 'Switch failed', $_.Exception.Message, 'Error')
@@ -437,8 +555,8 @@ function Invoke-SwitchAccount($id) {
 # Rebuild the account list every time the submenu opens.
 $miAccount.Add_DropDownOpening({
     $miAccount.DropDownItems.Clear()
-    try { Sync-ActiveProfile | Out-Null } catch {}
-    $profiles = Get-ClaudeProfiles
+    # The worker keeps profiles in sync; reuse its last identity check (no network here).
+    $profiles = Get-ClaudeProfiles (Get-KnownActive)
     if (-not $profiles) { $x = $miAccount.DropDownItems.Add('(no saved accounts)'); $x.Enabled = $false }
     # Active account first, bold, marked.
     foreach ($p in @($profiles | Sort-Object @{ e = { -not $_.Active } }, Name)) {
@@ -458,7 +576,7 @@ $miAccount.Add_DropDownOpening({
     $ren = $miAccount.DropDownItems.Add('Rename current account...')
     $ren.Add_Click({
         Add-Type -AssemblyName Microsoft.VisualBasic
-        $cur = Get-ClaudeProfiles | Where-Object Active | Select-Object -First 1
+        $cur = Get-ClaudeProfiles (Get-KnownActive) | Where-Object Active | Select-Object -First 1
         if (-not $cur) { return }
         $new = [Microsoft.VisualBasic.Interaction]::InputBox('Display name for this account:', 'Rename account', $cur.Name)
         if ($new) { Rename-ClaudeProfile $cur.Id $new; $script:ActiveName = $new; $overlay.Invalidate() }
@@ -513,6 +631,8 @@ $overlay.Add_Paint({
 
     $tf = New-Object System.Drawing.StringFormat
     $tf.Trimming = 'EllipsisCharacter'; $tf.FormatFlags = 'NoWrap'
+    $ef = New-Object System.Drawing.StringFormat      # wrapped text, cut with "..." at the box edge
+    $ef.Trimming = 'EllipsisCharacter'; $ef.FormatFlags = 'LineLimit'
     $cf = New-Object System.Drawing.StringFormat
     $cf.Alignment = 'Center'; $cf.LineAlignment = 'Center'
 
@@ -539,9 +659,12 @@ $overlay.Add_Paint({
         $tag = 'AUTO @ {0}%' -f $Settings.AutoSwitchAt
         $g.DrawString($tag, $fontTag, $fgDim, 58, 8)
     }
-    $status = if ($script:LastErr) { 'stale' } elseif ($script:LastOk) { $script:LastOk.ToString('HH:mm') } else { '...' }
+    $statusBr = $fgDim
+    $status = if (Test-Paused) { $statusBr = $warnBr; 'retry ' + $script:BackoffUntil.ToString('HH:mm') }
+              elseif ($script:LastErr) { 'stale' }
+              elseif ($script:LastOk) { $script:LastOk.ToString('HH:mm') } else { '...' }
     $sz = $g.MeasureString($status, $fontSmall)
-    $g.DrawString($status, $fontSmall, $fgDim, ($w - 60 - $sz.Width), 8)
+    $g.DrawString($status, $fontSmall, $statusBr, ($w - 60 - $sz.Width), 8)
 
     # Row 2: account name, full width
     $title = if ($script:ActiveName) { $script:ActiveName } else { 'Claude usage' }
@@ -549,8 +672,7 @@ $overlay.Add_Paint({
 
     $y = 44
     if (-not $script:Rows) {
-        $msg = if ($script:LastErr) { $script:LastErr } else { 'Loading...' }
-        $g.DrawString($msg, $fontSmall, $fgDim, (New-Object System.Drawing.RectangleF(10, $y, ($w - 20), 30)))
+        $g.DrawString((Get-StatusMessage), $fontSmall, $fgDim, (New-Object System.Drawing.RectangleF(10, $y, ($w - 20), 28)), $ef)
         $y += 34
     }
     foreach ($r in $script:Rows) { Draw-UsageRow $g $r $y $w 18 $false; $y += 34 }
@@ -560,8 +682,7 @@ $overlay.Add_Paint({
     if ($Settings.ShowAll) {
         $y += 6
         if (-not $script:Others) {
-            $msg = if ($script:OthersFetchedAt -eq [datetime]::MinValue) { 'Other accounts not checked yet...' } else { 'No other saved accounts. Click + to add one.' }
-            $g.DrawString($msg, $fontSmall, $fgDim, 10, $y)
+            $g.DrawString('No other saved accounts. Click + to add one.', $fontSmall, $fgDim, 10, $y)
         }
         $first = $true
         foreach ($o in $script:Others) {
@@ -583,14 +704,15 @@ $overlay.Add_Paint({
             $first = $false
             $y += 20
             if ($o.Err) {
-                $g.DrawString($o.Err, $fontSmall, $fgDim, (New-Object System.Drawing.RectangleF(10, $y, ($w - 20), 28)))
+                # Long errors are cut to two lines with "..." instead of spilling into the next account.
+                $g.DrawString($o.Err, $fontSmall, $fgDim, (New-Object System.Drawing.RectangleF(10, $y, ($w - 20), 26)), $ef)
                 $y += 30
             } else {
                 foreach ($r in $o.Rows) { Draw-UsageRow $g $r $y $w 16 $true; $y += 30 }
             }
         }
     }
-    $tf.Dispose(); $cf.Dispose()
+    $tf.Dispose(); $cf.Dispose(); $ef.Dispose()
 })
 
 function Draw-UsageRow($g, $r, [int]$y, [int]$w, [int]$barOffset, [bool]$dim) {
@@ -666,11 +788,35 @@ $timer.Add_Tick({ Update-Usage })
 
 # Profiles folder + active account fingerprint. Changes when an account is added,
 # removed, or switched - from the tray, the CLI, or anywhere else.
+# No network: profile folder names + when the credentials file last changed
+# (it changes on switches, sign-ins and token refreshes).
 function Get-ProfilesSignature {
     $ids = if (Test-Path $script:ProfilesDir) { (Get-ChildItem $script:ProfilesDir -Directory | ForEach-Object Name) -join ',' } else { '' }
-    $active = try { (Get-ActiveAccount).Id } catch { '' }
-    return "$ids|$active"
+    $cred = try { (Get-Item $CredPath).LastWriteTimeUtc.Ticks } catch { 0 }
+    return "$ids|$cred"
 }
+
+# Best-known active account without a network call: the worker's last check,
+# else whatever .claude.json says (good enough for listing names).
+function Get-KnownActive {
+    if ($script:LastAcct) { return $script:LastAcct }
+    try {
+        $a = (Read-ClaudeConfig)['oauthAccount']
+        if ($a) { return [pscustomobject]@{ Id = '{0}_{1}' -f $a['accountUuid'], $a['organizationUuid'] } }
+    } catch {}
+    return $null
+}
+
+# Polls the background worker (cheap; only runs while a check is in flight).
+$jobWatch = New-Object System.Windows.Forms.Timer
+$jobWatch.Interval = 200
+$jobWatch.Add_Tick({
+    if (-not $script:Job) { $jobWatch.Stop(); return }
+    if ($script:Job.Handle.IsCompleted) {
+        $jobWatch.Stop()
+        Complete-Refresh
+    }
+})
 function Test-ProfilesChanged {
     $sig = Get-ProfilesSignature
     if ($sig -eq $script:ProfSig) { return $false }
@@ -687,7 +833,10 @@ $addWatch.Add_Tick({
     $done = (-not $script:AddProc -or $script:AddProc.HasExited)
     if ($done) { $addWatch.Stop() }
     if ((Test-ProfilesChanged) -or $done) {
-        if (-not $Settings.ShowAll) { Set-ShowAll $true } else { Update-Usage }
+        if (-not $Settings.ShowAll) { Set-ShowAll $true } else {
+            Set-OtherPlaceholders (Get-ClaudeProfiles (Get-KnownActive))
+            Update-Usage -Full
+        }
     }
 })
 
@@ -695,7 +844,10 @@ $addWatch.Add_Tick({
 $tickTimer = New-Object System.Windows.Forms.Timer
 $tickTimer.Interval = 30000
 $tickTimer.Add_Tick({
-    if (Test-ProfilesChanged) { Update-Usage } else { $overlay.Invalidate() }
+    if (Test-ProfilesChanged) {
+        if ($Settings.ShowAll) { Set-OtherPlaceholders (Get-ClaudeProfiles (Get-KnownActive)) }
+        Update-Usage -Full
+    } else { $overlay.Invalidate() }
 })
 
 # ---------- go ----------
@@ -704,8 +856,14 @@ $overlay.Show()
 # ShowWindow call, so force it visible explicitly (SW_SHOWNOACTIVATE = 4).
 [Native.Win32]::ShowWindow($overlay.Handle, 4) | Out-Null
 if (-not $Settings.ShowOverlay) { $overlay.Hide() }
-# First refresh runs before the message loop, where WinForms can't catch errors for us.
-try { Update-Usage } catch { try { Add-Content $LogPath ("{0}  startup: {1}" -f (Get-Date -Format s), $_.Exception) } catch {} }
+# Startup runs before the message loop, where WinForms can't catch errors for us.
+try {
+    # List every saved account by name immediately; numbers arrive from the worker.
+    if ($Settings.ShowAll) { Set-OtherPlaceholders (Get-ClaudeProfiles (Get-KnownActive)) }
+    $script:ActiveName = (Get-ClaudeProfiles (Get-KnownActive) | Where-Object Active | Select-Object -First 1).Name
+    Update-Ui
+    Update-Usage -Full
+} catch { try { Add-Content $LogPath ("{0}  startup: {1}" -f (Get-Date -Format s), $_.Exception) } catch {} }
 $timer.Start(); $tickTimer.Start()
 
 [System.Windows.Forms.Application]::Run()
