@@ -201,6 +201,17 @@ function Get-ProfileAccessToken($P) {
     return $o['accessToken']
 }
 
+# ---------- rate-limit pause ----------
+# Is a saved rate-limit pause still in effect? It must be active (Sec > 0) and
+# end in the future - but no further ahead than its own length. That last check
+# catches clock jumps: a pause saved while the clock was an hour fast would
+# otherwise look like it still has an hour to go.
+function Test-BackoffActive([datetime]$Until, [int]$Sec, [datetime]$Now = (Get-Date)) {
+    if ($Sec -le 0) { return $false }
+    $remaining = ($Until - $Now).TotalSeconds
+    return ($remaining -gt 0 -and $remaining -le ($Sec + 5))
+}
+
 # ---------- usage notifications ----------
 # Decides which notices to show for one account's latest numbers. $State is a
 # hashtable kept between checks (per account) so each notice fires once:

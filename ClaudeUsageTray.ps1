@@ -228,17 +228,36 @@ function Save-State {
             ConvertTo-Json | Set-Content $StatePath -Encoding UTF8
     } catch {}
 }
+# A saved pause that's over, or impossible after a clock change, is dropped.
+if (-not (Test-BackoffActive $script:BackoffUntil $script:BackoffSec) -and
+    ($script:BackoffSec -ne 0 -or $script:BackoffUntil -ne [datetime]::MinValue)) {
+    $script:BackoffUntil = [datetime]::MinValue
+    $script:BackoffSec = 0   # restart doubling from 2 min
+    Save-State
+}
+# Fires when a pause is over so we check straight away. It counts elapsed time,
+# so changes to the system clock can't stretch or shrink the pause.
+$backoffTimer = New-Object System.Windows.Forms.Timer
+$backoffTimer.Add_Tick({ $backoffTimer.Stop(); Update-Ui; Update-Usage })
+function Start-BackoffTimer([double]$seconds) {
+    $backoffTimer.Stop()
+    $backoffTimer.Interval = [int]([math]::Max(1, $seconds) * 1000)
+    $backoffTimer.Start()
+}
 function Start-Backoff([int]$retryAfter) {
     $next = if ($script:BackoffSec -gt 0) { $script:BackoffSec * 2 } else { 120 }
     $script:BackoffSec = [math]::Min(900, [math]::Max($retryAfter, $next))
     $script:BackoffUntil = (Get-Date).AddSeconds($script:BackoffSec)
     Save-State
+    Start-BackoffTimer $script:BackoffSec
 }
 function Clear-Backoff {
-    if ($script:BackoffSec -ne 0) { $script:BackoffSec = 0; Save-State }
+    if ($script:BackoffSec -ne 0 -or $script:BackoffUntil -ne [datetime]::MinValue) {
+        $script:BackoffSec = 0; $script:BackoffUntil = [datetime]::MinValue; Save-State
+    }
 }
 function Get-BackoffMessage { 'Rate limited - retrying at {0}' -f $script:BackoffUntil.ToString('HH:mm') }
-function Test-Paused { (Get-Date) -lt $script:BackoffUntil }
+function Test-Paused { Test-BackoffActive $script:BackoffUntil $script:BackoffSec }
 function Test-Stale  { [bool]($script:LastErr -or (Test-Paused)) }
 # What to say when there are no numbers to show.
 function Get-StatusMessage {
@@ -313,7 +332,7 @@ function Update-Usage([switch]$Full) {
 }
 
 function Request-Refresh([bool]$WantOthers) {
-    if ((Get-Date) -lt $script:BackoffUntil) { Update-Ui; return }   # rate limited: stay off the network
+    if (Test-Paused) { Update-Ui; return }   # rate limited: stay off the network
     if ($script:Job) {
         # Busy: remember to run again afterwards (merging "others" requests).
         $script:QueuedOthers = [bool]($WantOthers -or $script:QueuedOthers)
@@ -1009,6 +1028,8 @@ try {
     if ($Settings.ShowAll) { Set-OtherPlaceholders (Get-ClaudeProfiles (Get-KnownActive)) }
     $script:ActiveName = (Get-ClaudeProfiles (Get-KnownActive) | Where-Object Active | Select-Object -First 1).Name
     Update-Ui
+    # Still inside a saved pause from before a restart? Check again when it ends.
+    if (Test-Paused) { Start-BackoffTimer ($script:BackoffUntil - (Get-Date)).TotalSeconds }
     Update-Usage -Full
 } catch { try { Add-Content $LogPath ("{0}  startup: {1}" -f (Get-Date -Format s), $_.Exception) } catch {} }
 $timer.Start(); $tickTimer.Start()

@@ -223,6 +223,23 @@ Test 'nothing qualifies -> no target' {
     Assert-Equal $null (Select-AutoSwitchTarget (Others) (New-SwitchRules 99 10 90)) 'target'
 }
 
+Write-Host 'Rate-limit pause' -ForegroundColor Cyan
+
+$t0 = [datetime]'2026-11-12T00:48:00'
+Test 'a pause in progress is active' {
+    Assert-True (Test-BackoffActive $t0.AddSeconds(100) 120 $t0) 'active'
+}
+Test 'a finished pause is not active' {
+    Assert-True (-not (Test-BackoffActive $t0.AddSeconds(-1) 120 $t0)) 'over'
+}
+Test 'a cleared pause (length 0) is ignored even if its end time is in the future' {
+    Assert-True (-not (Test-BackoffActive $t0.AddMinutes(40) 0 $t0)) 'cleared'
+}
+Test 'a pause saved while the clock was an hour fast is ignored' {
+    # 2-minute pause whose end time now looks 40 minutes away after the clock was corrected
+    Assert-True (-not (Test-BackoffActive $t0.AddMinutes(40) 120 $t0)) 'clock jump'
+}
+
 Write-Host 'Notifications' -ForegroundColor Cyan
 
 Test 'warns once when a limit crosses the threshold' {
