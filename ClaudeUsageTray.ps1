@@ -448,14 +448,17 @@ function Get-OverlayHeight {
     $h = $script:HeaderH + [math]::Max(1, @(Get-DisplayRows $script:Rows).Count) * 34
     if ($Settings.ShowAll) {
         $h += 6    # gap below the active panel
-        if (-not $script:Others) { $h += 20 }
-        foreach ($o in $script:Others) {
-            $h += 20
-            $h += if ($o.Err) { 30 } else { @(Get-DisplayRows $o.Rows).Count * 30 }
-        }
-        $h += 4
+        if (-not $script:Others) { $h += 24 }
+        foreach ($o in $script:Others) { $h += (Get-CardHeight $o) + $script:CardGap }
     }
     return $h
+}
+
+# Each other account is drawn as a card: padding, name line, then its limit rows.
+$script:CardGap = 6
+function Get-CardHeight($o) {
+    $body = if ($o.Err) { 30 } else { @(Get-DisplayRows $o.Rows).Count * 30 }
+    return 7 + 20 + $body
 }
 
 # The binding limit = the one with the least left.
@@ -527,6 +530,7 @@ function Update-Ui {
     # Grow upwards if the taller overlay would run off the bottom of its screen.
     $scr = [System.Windows.Forms.Screen]::FromControl($overlay).WorkingArea
     if ($overlay.Bottom -gt $scr.Bottom) { $overlay.Top = [math]::Max($scr.Top, $scr.Bottom - $overlay.Height - 8) }
+    if ($overlay.Right -gt $scr.Right) { $overlay.Left = [math]::Max($scr.Left, $scr.Right - $overlay.Width) }
     $overlay.Invalidate()
 }
 
@@ -701,7 +705,7 @@ $overlay.FormBorderStyle = 'None'
 $overlay.ShowInTaskbar = $false
 $overlay.TopMost = $true
 $overlay.StartPosition = 'Manual'
-$overlay.Width = [int](250 * $UiScale)
+$overlay.Width = [int](270 * $UiScale)
 $overlay.Height = [int](100 * $UiScale)
 $overlay.BackColor = [System.Drawing.Color]::FromArgb(30, 30, 34)
 $overlay.Opacity = [double]$Settings.Opacity
@@ -740,6 +744,9 @@ $accentBr   = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::From
 $activeBgBr = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(38, 42, 56))
 $warnBr     = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(225, 120, 110))
 $fontTag    = New-Object System.Drawing.Font('Segoe UI', 9, [System.Drawing.FontStyle]::Bold, $px)
+$fontName   = New-Object System.Drawing.Font('Segoe UI Semibold', 12, [System.Drawing.FontStyle]::Regular, $px)
+$fgName     = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(215, 215, 225))
+$cardBr     = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(40, 40, 47))
 
 $overlay.Add_Paint({
     param($s, $e)
@@ -809,6 +816,10 @@ $overlay.Add_Paint({
         }
         $first = $true
         foreach ($o in $script:Others) {
+            # Card background separates each account from the next.
+            $cardH = Get-CardHeight $o
+            $g.FillRectangle($cardBr, 4, $y, ($w - 8), $cardH)
+            $y += 7
             $link = New-Object System.Drawing.Rectangle(($w - 50), $y, 42, 16)
             $script:SwitchRects += @{ Rect = $link; Id = $o.Id }
             $g.DrawString('Switch', $fontSmall, $accentBr, [System.Drawing.RectangleF]$link, $cf)
@@ -823,7 +834,7 @@ $overlay.Add_Paint({
                 $g.DrawString($tag, $fontTag, $tagBr, ($w - 54 - $tsz.Width), ($y + 2))
                 $nameW = $w - 60 - $tsz.Width - 4
             }
-            $g.DrawString($o.Name, $fontRow, $fgDim, (New-Object System.Drawing.RectangleF(10, $y, $nameW, 16)), $tf)
+            $g.DrawString($o.Name, $fontName, $fgName, (New-Object System.Drawing.RectangleF(10, ($y - 1), $nameW, 18)), $tf)
             $first = $false
             $y += 20
             if ($o.Err) {
@@ -833,6 +844,7 @@ $overlay.Add_Paint({
             } else {
                 foreach ($r in (Get-DisplayRows $o.Rows)) { Draw-UsageRow $g $r $y $w 16 $true; $y += 30 }
             }
+            $y += $script:CardGap
         }
     }
     $tf.Dispose(); $cf.Dispose(); $ef.Dispose()
