@@ -28,7 +28,15 @@ Add-Type -Namespace Native -Name Win32 -MemberDefinition @'
 [DllImport("user32.dll")] public static extern bool ReleaseCapture();
 [DllImport("user32.dll")] public static extern IntPtr SendMessage(IntPtr hWnd, int msg, int wParam, int lParam);
 [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+[DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
 '@
+
+# Draw at the screen's real resolution instead of letting Windows stretch a
+# 96-DPI bitmap (blurry text on scaled displays). Must happen before any window
+# exists. Layout is written in 96-DPI units and scaled by $UiScale.
+[Native.Win32]::SetProcessDPIAware() | Out-Null
+$UiScale = 1.0
+try { $sg = [System.Drawing.Graphics]::FromHwnd([IntPtr]::Zero); $UiScale = $sg.DpiX / 96.0; $sg.Dispose() } catch {}
 
 # ---------- single instance ----------
 $createdNew = $false
@@ -48,7 +56,7 @@ $script:ActiveName = $null
 
 $Settings = [ordered]@{
     ShowOverlay       = $true; X = -1; Y = -1; Opacity = 0.92
-    ActiveIntervalSec = 60    # how often the active account is checked (drives auto-switch)
+    ActiveIntervalSec = 120   # how often the active account is checked (drives auto-switch); the endpoint is rate-limited
     OthersIntervalMin = 10    # how often other accounts are checked while "All" is on
 }
 if (Test-Path $SettingsPath) {
@@ -91,6 +99,51 @@ $script:MismatchNotified  = $false
 $script:AutoCooldownUntil = [datetime]::MinValue
 $script:AutoNotified      = $false
 $script:SwitchRects       = @()   # clickable account names in the overlay: @{ Rect; Id }
+if ($null -eq $Settings.NotifyAt)    { $Settings.NotifyAt = 80 }      # warn when a limit reaches this % (0 = off)
+if ($null -eq $Settings.NotifyReset) { $Settings.NotifyReset = $true } # tell me when a limit resets
+$script:NoticeStates      = @{}   # per account id: state for Get-UsageNotices
+
+function Show-UsageNotices {
+    if (-not $script:Rows -or -not $script:LastAcct) { return }
+    $id = $script:LastAcct.Id
+    if (-not $script:NoticeStates.ContainsKey($id)) { $script:NoticeStates[$id] = @{} }
+    $n = Get-UsageNotices $script:Rows $script:NoticeStates[$id] ([double]$Settings.NotifyAt) ([bool]$Settings.NotifyReset)
+    if (-not $n) { return }
+    # Windows shows one balloon at a time, so combine them.
+    $lines = foreach ($x in $n) {
+        if ($x.Kind -eq 'warn') {
+            '{0} is at {1}% used (resets in {2}).' -f $x.Row.Label, [int]$x.Row.Used, (Format-Until $x.Row.Resets)
+        } else {
+            '{0} has reset ({1}% used now).' -f $x.Row.Label, [int]$x.Row.Used
+        }
+    }
+    $title = if (@($n | Where-Object { $_.Kind -eq 'warn' })) { "Claude usage: $($script:ActiveName)" } else { 'Claude limit reset' }
+    $icon = if (@($n | Where-Object { $_.Kind -eq 'warn' })) { 'Warning' } else { 'Info' }
+    $tray.ShowBalloonTip(8000, $title, ($lines -join "`n"), $icon)
+}
+$script:SwitchedAt        = $null # when we last switched (to spot sessions still on the old login)
+$script:SwitchedFrom      = $null
+$script:OldSessions       = 0
+
+# Call right after a switch; returns how many Claude Code sessions are still on the old login.
+function Register-Switch([string]$fromName) {
+    $script:SwitchedAt = Get-Date
+    $script:SwitchedFrom = $fromName
+    Update-OldSessions
+    return $script:OldSessions
+}
+function Update-OldSessions {
+    if (-not $script:SwitchedAt) { $script:OldSessions = 0; return }
+    $script:OldSessions = @(Get-ClaudeCodeProcesses $script:SwitchedAt).Count
+    if ($script:OldSessions -eq 0) { $script:SwitchedAt = $null }   # all restarted: done
+}
+function Format-OldSessions([int]$n, [string]$from) {
+    if ($n -le 0) { return '' }
+    $s = if ($n -eq 1) { 'session is' } else { 'sessions are' }
+    return (' {0} running Claude Code {1} still on {2}; restart them to use the new account.' -f $n, $s, $from)
+}
+# Header grows a line while old sessions are still running.
+function Get-HeaderH { if ($script:OldSessions -gt 0) { 60 } else { 44 } }
 
 # ---------- helpers ----------
 function Format-Until($when) {
@@ -281,6 +334,7 @@ function Apply-Result($r) {
     if ($r.Err) { $script:LastErr = $r.Err } else {
         $script:Rows = $r.Rows; $script:LastErr = $null; $script:LastOk = Get-Date
         Clear-Backoff
+        if (-not $script:Mismatch) { Show-UsageNotices }
     }
 
     $othersFresh = $false
@@ -341,13 +395,15 @@ function Invoke-AutoSwitch([bool]$OthersFresh) {
     # covers stale numbers. Kept short so a nearly-spent account can hand off fast.
     $script:AutoCooldownUntil = (Get-Date).AddMinutes(1)
     $script:AutoNotified = $false
+    $old = Register-Switch $from
+    $script:ActiveName = $target.Name
     $tray.ShowBalloonTip(8000, 'Claude auto-switched account',
-        ("{0} reached {1}% used. Now using {2}. Restart running Claude Code sessions to pick it up." -f $from, [int]$used, $target.Name), 'Info')
+        (("{0} reached {1}% used. New Claude Code sessions will use {2}." -f $from, [int]$used, $target.Name) + (Format-OldSessions $old $from)), 'Info')
     Request-Refresh $true
 }
 
 function Get-OverlayHeight {
-    $h = 44 + [math]::Max(1, @($script:Rows).Count) * 34
+    $h = (Get-HeaderH) + [math]::Max(1, @($script:Rows).Count) * 34
     if ($Settings.ShowAll) {
         $h += 6    # gap below the active panel
         if (-not $script:Others) { $h += 20 }
@@ -425,7 +481,7 @@ function Update-Ui {
     if ($tip.Length -gt 63) { $tip = $tip.Substring(0, 60) + '...' }
     $tray.Text = $tip
 
-    $overlay.Height = Get-OverlayHeight
+    $overlay.Height = [int]((Get-OverlayHeight) * $UiScale)
     # Grow upwards if the taller overlay would run off the bottom of its screen.
     $scr = [System.Windows.Forms.Screen]::FromControl($overlay).WorkingArea
     if ($overlay.Bottom -gt $scr.Bottom) { $overlay.Top = [math]::Max($scr.Top, $scr.Bottom - $overlay.Height - 8) }
@@ -509,6 +565,17 @@ $miRate.DropDownItems.Add('-') | Out-Null
 Add-RadioGroup $miRate 'Other accounts (while All is on)' @(@(5, '5 minutes'), @(10, '10 minutes'), @(15, '15 minutes'), @(30, '30 minutes')) 'OthersIntervalMin'
 $note = $miRate.DropDownItems.Add('Auto-switch always re-checks them before switching'); $note.Enabled = $false
 
+# Notifications submenu (placed just above Auto-switch)
+$miNotify = New-Object System.Windows.Forms.ToolStripMenuItem 'Notifications'
+$menu.Items.Insert($menu.Items.IndexOf($miAuto), $miNotify)
+Add-RadioGroup $miNotify 'Warn when a limit reaches' @(@(0, 'Off'), @(70, '70% used'), @(80, '80% used'), @(90, '90% used')) 'NotifyAt'
+$miNotify.DropDownItems.Add('-') | Out-Null
+$miReset = New-Object System.Windows.Forms.ToolStripMenuItem 'Tell me when a limit resets'
+$miReset.CheckOnClick = $true
+$miReset.Checked = [bool]$Settings.NotifyReset
+$miReset.Add_CheckedChanged({ $Settings.NotifyReset = $miReset.Checked; Save-Settings })
+$miNotify.DropDownItems.Add($miReset) | Out-Null
+
 $miAccount = New-Object System.Windows.Forms.ToolStripMenuItem 'Account'
 $menu.Items.Add($miAccount) | Out-Null
 $miAccount.DropDownItems.Add('(loading)') | Out-Null   # placeholder so the arrow shows
@@ -539,14 +606,16 @@ function Set-ShowAll([bool]$on) {
 
 function Invoke-SwitchAccount($id) {
     try {
+        $from = $script:ActiveName
         $p = Switch-ClaudeProfile $id
         # Respect a manual choice: auto-switch won't override it for 5 minutes.
         $script:AutoCooldownUntil = (Get-Date).AddMinutes(5)
+        $old = Register-Switch $from
         $script:ActiveName = $p.Name    # show it right away; numbers follow from the worker
         $script:Rows = @(); $script:LastAcct = $null
         Update-Usage -Full
         Update-Ui
-        $tray.ShowBalloonTip(4000, 'Claude account switched', "Now using $($p.Name). Restart any running Claude Code sessions.", 'Info')
+        $tray.ShowBalloonTip(6000, 'Claude account switched', ("New Claude Code sessions will use $($p.Name)." + (Format-OldSessions $old $from)), 'Info')
     } catch {
         $tray.ShowBalloonTip(5000, 'Switch failed', $_.Exception.Message, 'Error')
     }
@@ -593,8 +662,8 @@ $overlay.FormBorderStyle = 'None'
 $overlay.ShowInTaskbar = $false
 $overlay.TopMost = $true
 $overlay.StartPosition = 'Manual'
-$overlay.Width = 250
-$overlay.Height = 100
+$overlay.Width = [int](250 * $UiScale)
+$overlay.Height = [int](100 * $UiScale)
 $overlay.BackColor = [System.Drawing.Color]::FromArgb(30, 30, 34)
 $overlay.Opacity = [double]$Settings.Opacity
 $overlay.Text = 'Claude Usage'
@@ -603,15 +672,26 @@ $overlay.ContextMenuStrip = $menu
 $overlay.GetType().GetProperty('DoubleBuffered', [Reflection.BindingFlags]'Instance,NonPublic').SetValue($overlay, $true, $null)
 
 $wa = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
-if ($Settings.X -lt 0 -or $Settings.Y -lt 0) {
-    $overlay.Location = New-Object System.Drawing.Point(($wa.Right - $overlay.Width - 12), ($wa.Bottom - 140))
-} else {
-    $overlay.Location = New-Object System.Drawing.Point([int]$Settings.X, [int]$Settings.Y)
+# Positions saved by older versions were in Windows' stretched (96-DPI) coordinates.
+if (-not $Settings.PosPhysical) {
+    if ($Settings.X -ge 0 -and $Settings.Y -ge 0) { $Settings.X = [int]($Settings.X * $UiScale); $Settings.Y = [int]($Settings.Y * $UiScale) }
+    $Settings.PosPhysical = $true
+    Save-Settings
 }
+$startPos = New-Object System.Drawing.Point(($wa.Right - $overlay.Width - [int](12 * $UiScale)), ($wa.Bottom - [int](140 * $UiScale)))
+if ($Settings.X -ge 0 -and $Settings.Y -ge 0) {
+    $saved = New-Object System.Drawing.Point([int]$Settings.X, [int]$Settings.Y)
+    # Only use the saved spot if it's still on a connected screen.
+    $onScreen = [System.Windows.Forms.Screen]::AllScreens | Where-Object { $_.WorkingArea.Contains($saved) }
+    if ($onScreen) { $startPos = $saved }
+}
+$overlay.Location = $startPos
 
-$fontTitle = New-Object System.Drawing.Font('Segoe UI', 8.5, [System.Drawing.FontStyle]::Bold)
-$fontRow   = New-Object System.Drawing.Font('Segoe UI', 8.5)
-$fontSmall = New-Object System.Drawing.Font('Segoe UI', 7.5)
+# Pixel-sized fonts so they scale with the drawing transform (8.5pt = 11.33px at 96 DPI).
+$px = [System.Drawing.GraphicsUnit]::Pixel
+$fontTitle = New-Object System.Drawing.Font('Segoe UI', 11.33, [System.Drawing.FontStyle]::Bold, $px)
+$fontRow   = New-Object System.Drawing.Font('Segoe UI', 11.33, [System.Drawing.FontStyle]::Regular, $px)
+$fontSmall = New-Object System.Drawing.Font('Segoe UI', 10, [System.Drawing.FontStyle]::Regular, $px)
 $fgMain  = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(235, 235, 240))
 $fgDim   = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(150, 150, 160))
 $trackBr = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(60, 60, 68))
@@ -620,14 +700,16 @@ $btnOnBr = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArg
 $accentBr   = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(110, 155, 255))
 $activeBgBr = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(38, 42, 56))
 $warnBr     = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(225, 120, 110))
-$fontTag    = New-Object System.Drawing.Font('Segoe UI', 6.75, [System.Drawing.FontStyle]::Bold)
+$fontTag    = New-Object System.Drawing.Font('Segoe UI', 9, [System.Drawing.FontStyle]::Bold, $px)
 
 $overlay.Add_Paint({
     param($s, $e)
     $g = $e.Graphics
     $g.SmoothingMode = 'AntiAlias'
     $g.TextRenderingHint = 'ClearTypeGridFit'
-    $w = $overlay.ClientSize.Width
+    # Everything below is laid out in 96-DPI units; this scales it to the real screen.
+    $g.ScaleTransform([float]$UiScale, [float]$UiScale)
+    $w = [int]($overlay.ClientSize.Width / $UiScale)
 
     $tf = New-Object System.Drawing.StringFormat
     $tf.Trimming = 'EllipsisCharacter'; $tf.FormatFlags = 'NoWrap'
@@ -637,7 +719,8 @@ $overlay.Add_Paint({
     $cf.Alignment = 'Center'; $cf.LineAlignment = 'Center'
 
     # ---- Active account block: always on top, tinted panel + accent stripe ----
-    $activeH = 44 + [math]::Max(1, @($script:Rows).Count) * 34 - 4
+    $headerH = Get-HeaderH
+    $activeH = $headerH + [math]::Max(1, @($script:Rows).Count) * 34 - 4
     $g.FillRectangle($activeBgBr, 0, 0, $w, $activeH)
     $g.FillRectangle($accentBr, 0, 0, 3, $activeH)
 
@@ -670,7 +753,14 @@ $overlay.Add_Paint({
     $title = if ($script:ActiveName) { $script:ActiveName } else { 'Claude usage' }
     $g.DrawString($title, $fontTitle, $fgMain, (New-Object System.Drawing.RectangleF(10, 24, ($w - 18), 16)), $tf)
 
-    $y = 44
+    # Row 3 (only after a switch): sessions still running on the old login
+    if ($script:OldSessions -gt 0) {
+        $s = if ($script:OldSessions -eq 1) { 'session' } else { 'sessions' }
+        $msg = '{0} Claude Code {1} still on {2} - restart' -f $script:OldSessions, $s, $script:SwitchedFrom
+        $g.DrawString($msg, $fontSmall, $warnBr, (New-Object System.Drawing.RectangleF(10, 41, ($w - 18), 15)), $tf)
+    }
+
+    $y = $headerH
     if (-not $script:Rows) {
         $g.DrawString((Get-StatusMessage), $fontSmall, $fgDim, (New-Object System.Drawing.RectangleF(10, $y, ($w - 20), 28)), $ef)
         $y += 34
@@ -720,7 +810,8 @@ function Draw-UsageRow($g, $r, [int]$y, [int]$w, [int]$barOffset, [bool]$dim) {
     $fillPct = if ($Settings.ShowRemaining) { $left } else { 100 - $left }
     $labelBr = if ($dim) { $fgDim } else { $fgMain }
     $g.DrawString($r.Label, $fontRow, $labelBr, 10, $y)
-    $right = '{0} - {1}' -f (Format-Pct $r), (Format-Until $r.Resets)
+    $until = Format-Until $r.Resets
+    $right = if ($until) { '{0} - {1}' -f (Format-Pct $r), $until } else { Format-Pct $r }   # unused limits have no reset time
     $sz = $g.MeasureString($right, $fontSmall)
     $g.DrawString($right, $fontSmall, $fgDim, ($w - $sz.Width - 8), ($y + 1))
     $barW = $w - 20
@@ -736,10 +827,12 @@ function Draw-UsageRow($g, $r, [int]$y, [int]$w, [int]$barOffset, [bool]$dim) {
 $overlay.Add_MouseDown({
     param($s, $e)
     if ($e.Button -eq 'Left') {
-        if ($script:BtnAll.Contains($e.Location)) { Set-ShowAll (-not $Settings.ShowAll); return }
-        if ($script:BtnAdd.Contains($e.Location)) { Start-AddAccount; return }
+        # Button rectangles are in layout units; convert the click from screen pixels.
+        $pt = New-Object System.Drawing.Point([int]($e.X / $UiScale), [int]($e.Y / $UiScale))
+        if ($script:BtnAll.Contains($pt)) { Set-ShowAll (-not $Settings.ShowAll); return }
+        if ($script:BtnAdd.Contains($pt)) { Start-AddAccount; return }
         foreach ($sr in $script:SwitchRects) {
-            if ($sr.Rect.Contains($e.Location)) { Invoke-SwitchAccount $sr.Id; return }
+            if ($sr.Rect.Contains($pt)) { Invoke-SwitchAccount $sr.Id; return }
         }
         [Native.Win32]::ReleaseCapture() | Out-Null
         [Native.Win32]::SendMessage($overlay.Handle, 0xA1, 0x2, 0) | Out-Null   # WM_NCLBUTTONDOWN, HTCAPTION
@@ -844,6 +937,12 @@ $addWatch.Add_Tick({
 $tickTimer = New-Object System.Windows.Forms.Timer
 $tickTimer.Interval = 30000
 $tickTimer.Add_Tick({
+    # Still waiting for old Claude Code sessions to be restarted? Re-count (local, cheap).
+    if ($script:SwitchedAt) {
+        $before = $script:OldSessions
+        Update-OldSessions
+        if ($script:OldSessions -ne $before) { Update-Ui }   # height may change
+    }
     if (Test-ProfilesChanged) {
         if ($Settings.ShowAll) { Set-OtherPlaceholders (Get-ClaudeProfiles (Get-KnownActive)) }
         Update-Usage -Full

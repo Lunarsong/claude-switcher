@@ -201,6 +201,49 @@ function Get-ProfileAccessToken($P) {
     return $o['accessToken']
 }
 
+# ---------- usage notifications ----------
+# Decides which notices to show for one account's latest numbers. $State is a
+# hashtable kept between checks (per account) so each notice fires once:
+#   'warn'  - a limit reached $WarnAt % (once per reset window)
+#   'reset' - a limit that was at least half used dropped to under half of that
+# Returns @( @{ Kind; Row } ... ).
+function Get-UsageNotices($Rows, [hashtable]$State, [double]$WarnAt, [bool]$OnReset) {
+    $notices = @()
+    foreach ($r in @($Rows)) {
+        $key = [string]$r.Label
+        $st = $State[$key]
+        if (-not $st) { $st = @{ WarnedFor = $null; PrevUsed = $null }; $State[$key] = $st }
+        $window = if ($r.Resets -is [datetime]) { $r.Resets.ToUniversalTime().ToString('yyyyMMddHH') } else { 'none' }
+        $used = [double]$r.Used
+
+        if ($OnReset -and $null -ne $st.PrevUsed -and $st.PrevUsed -ge 50 -and $used -lt ($st.PrevUsed / 2)) {
+            $notices += @{ Kind = 'reset'; Row = $r }
+            $st.WarnedFor = $null
+        }
+        if ($WarnAt -gt 0 -and $used -ge $WarnAt -and $st.WarnedFor -ne $window) {
+            $notices += @{ Kind = 'warn'; Row = $r }
+            $st.WarnedFor = $window
+        }
+        $st.PrevUsed = $used
+    }
+    return ,$notices
+}
+
+# ---------- running Claude Code sessions ----------
+# Claude Code sessions are claude.exe processes (CLI, IDE extensions, the desktop
+# app's Code tab). The desktop app's own Electron windows are also claude.exe, under
+# ...\AnthropicClaude\app-*, so those are excluded. -StartedBefore keeps only
+# processes that were already running then (i.e. still on the previous login).
+function Get-ClaudeCodeProcesses([Nullable[datetime]]$StartedBefore = $null) {
+    @(Get-Process -Name claude -ErrorAction SilentlyContinue | Where-Object {
+        $path = $null; $start = $null
+        try { $path = $_.Path; $start = $_.StartTime } catch {}
+        if (-not $path -or $path -match '\\AnthropicClaude\\app-') { return $false }
+        if ($StartedBefore -and (-not $start -or $start -ge $StartedBefore)) { return $false }
+        $true
+    })
+}
+
 # ---------- auto-switch selection ----------
 function Get-MaxUsed($Rows) {
     $m = 0.0

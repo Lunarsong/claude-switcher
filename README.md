@@ -5,7 +5,15 @@ A Windows tray icon and a small always-on-top overlay that show how much of your
 - **Tray icon:** a coloured circle showing the % used on your *tightest* limit. It's green while under 70% used, amber at 70–90%, red above 90%, and grey when the data is stale or there was an error. Hover over it for every limit.
 - **Overlay:** one bar per limit: the 5-hour session, weekly, and per-model weekly (such as "Weekly Fable"). Like claude.ai, bars start empty and fill as you use them, with the % used and time until reset. Turn on **Show remaining instead of used** in the menu to flip this. Drag the overlay to move it (its position is saved), and double-click it to refresh.
 - New, removed or switched accounts are picked up automatically within 30 seconds, including ones changed from the CLI.
-- **Right-click menu** (tray or overlay): Show overlay, Refresh now, Open claude.ai usage page, Start with Windows, Exit. Left-clicking the tray icon toggles the overlay.
+- **Right-click menu** (tray or overlay): Show overlay, Refresh now, Check usage every, Open claude.ai usage page, Start with Windows, Notifications, Auto-switch, Account, Exit. Left-clicking the tray icon toggles the overlay.
+- Text is drawn at your screen's real resolution, so it stays sharp at any Windows display scaling.
+
+### Notifications
+
+Under **Tray → Notifications**:
+
+- **Warn when a limit reaches** Off / 70 / **80** / 90 % used. Each limit warns once per reset window, with the time until it resets.
+- **Tell me when a limit resets** (on by default): a notice when a limit that was at least half used drops back down.
 
 ## Switching accounts
 
@@ -36,11 +44,11 @@ Click **All** on the overlay (or **Show all accounts** in the menu) to list usag
 - **Prefer:** **Soonest weekly reset** (spend allowance before it expires) or **Most weekly room left**. The other option breaks ties.
 - If no account qualifies, you get a single warning that says why for each account, and it doesn't repeat until usage drops and rises again.
 - After an auto-switch it waits 1 minute; after a manual switch, 5 minutes, so it doesn't override a choice you just made. Since targets are never full, it can't ping-pong.
-- The active account is checked every minute by default, so a very fast session can still pass the threshold before the switch happens. A lower threshold (such as 95%) gives more margin.
+- The active account is checked every 2 minutes by default, so a very fast session can still pass the threshold before the switch happens. A lower threshold (such as 95%) gives more margin.
 
 With **All** on, other accounts are listed in auto-switch priority order. The one it would pick is tagged **NEXT**, and accounts it would skip show why: **SESSION FULL**, **WEEKLY FULL**, **LOW SESSION**, **LOW WEEKLY** or **ERROR**.
 
-**Running Claude Code sessions keep the old login until restarted**, so an auto-switch helps the next session you start, not one already in progress.
+**Running Claude Code sessions keep the old login until restarted**, so an auto-switch helps the next session you start, not one already in progress. After any switch, the overlay shows how many Claude Code sessions are still on the old account (for example "2 Claude Code sessions still on a@… – restart"), and the line goes away once they've all been restarted. It counts `claude.exe` processes from the CLI, IDE extensions and the desktop app's Code tab, and skips the desktop app's own windows. It never closes sessions for you.
 
 ### Switching
 
@@ -70,11 +78,19 @@ powershell -NoProfile -STA -ExecutionPolicy Bypass -File ClaudeUsageTray.ps1
 
 It needs only Windows PowerShell 5.1, which is built in. There are no other dependencies.
 
+## Tests
+
+```
+powershell -NoProfile -ExecutionPolicy Bypass -File tests\Run-Tests.ps1
+```
+
+These cover the login-file handling (verification, mismatch protection, switching, token refresh), parsing of usage responses, the auto-switch rules and the notifications. They use temporary files and fake network responses, so they never touch your real login and need no internet. The exit code is the number of failures.
+
 ## How it works
 
 It polls `https://api.anthropic.com/api/oauth/usage`, the same data Claude Code's `/usage` shows. Set the timing under **Tray → Check usage every**:
 
-- **Active account:** every **1 minute** by default (30 seconds to 5 minutes). This drives auto-switch.
+- **Active account:** every **2 minutes** by default (30 seconds to 5 minutes). This drives auto-switch. Shorter intervals react faster but are more likely to hit Anthropic's rate limit.
 - **Other accounts:** every **10 minutes** by default (5 to 30 minutes), and only while **All** is on. Auto-switch always re-checks them right before choosing.
 - **Refresh now** or double-clicking the overlay checks everything immediately.
 

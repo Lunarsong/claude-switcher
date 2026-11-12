@@ -83,7 +83,9 @@ switch ($Command) {
     'use'    {
         if (-not $Rest) { throw 'Usage: claude-profile use <name>' }
         $p = Switch-ClaudeProfile ($Rest -join ' ')
-        Write-Host "Switched to $($p.Name). Restart any running Claude Code sessions."
+        Write-Host "Switched to $($p.Name). New Claude Code sessions will use it."
+        $old = @(Get-ClaudeCodeProcesses (Get-Date)).Count
+        if ($old -gt 0) { Write-Host "$old running Claude Code session(s) are still on the previous account; restart them." -ForegroundColor Yellow }
     }
     'rename' {
         if ($Rest.Count -lt 2) { throw 'Usage: claude-profile rename <name> <new name>' }
