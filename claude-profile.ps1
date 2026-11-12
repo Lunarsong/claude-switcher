@@ -28,6 +28,16 @@ function Show-List {
     }
 }
 
+# After a switch: confirm it and point out sessions still on the previous login.
+function Write-SwitchResult([string]$Name) {
+    Write-Host "Switched to $Name. New Claude Code sessions will use it."
+    $old = @(Get-ClaudeCodeProcesses (Get-Date)).Count
+    if ($old -gt 0) {
+        $s, $it = if ($old -eq 1) { 'session is', 'it' } else { 'sessions are', 'them' }
+        Write-Host "$old running Claude Code $s still on the previous account; restart $it to use $Name." -ForegroundColor Yellow
+    }
+}
+
 function Add-Account([string]$Name) {
     # Keep whatever is signed in now.
     Sync-ActiveProfile | Out-Null
@@ -54,7 +64,7 @@ function Add-Account([string]$Name) {
     $ans = Read-Host 'Switch to it now? [y/N]'
     if ($ans -match '^(y|yes)$') {
         Switch-ClaudeProfile $id | Out-Null
-        Write-Host "Switched. Restart any running Claude Code sessions."
+        Write-SwitchResult $p.Name
     } else {
         Write-Host "Not switched. Use the tray's Account menu or: claude-profile use `"$($p.Name)`""
     }
@@ -83,9 +93,7 @@ switch ($Command) {
     'use'    {
         if (-not $Rest) { throw 'Usage: claude-profile use <name>' }
         $p = Switch-ClaudeProfile ($Rest -join ' ')
-        Write-Host "Switched to $($p.Name). New Claude Code sessions will use it."
-        $old = @(Get-ClaudeCodeProcesses (Get-Date)).Count
-        if ($old -gt 0) { Write-Host "$old running Claude Code session(s) are still on the previous account; restart them." -ForegroundColor Yellow }
+        Write-SwitchResult $p.Name
     }
     'rename' {
         if ($Rest.Count -lt 2) { throw 'Usage: claude-profile rename <name> <new name>' }
