@@ -240,21 +240,6 @@ function Get-UsageNotices($Rows, [hashtable]$State, [double]$WarnAt, [bool]$OnRe
     return ,$notices
 }
 
-# ---------- running Claude Code sessions ----------
-# Claude Code sessions are claude.exe processes (CLI, IDE extensions, the desktop
-# app's Code tab). The desktop app's own Electron windows are also claude.exe, under
-# ...\AnthropicClaude\app-*, so those are excluded. -StartedBefore keeps only
-# processes that were already running then (i.e. still on the previous login).
-function Get-ClaudeCodeProcesses([Nullable[datetime]]$StartedBefore = $null) {
-    @(Get-Process -Name claude -ErrorAction SilentlyContinue | Where-Object {
-        $path = $null; $start = $null
-        try { $path = $_.Path; $start = $_.StartTime } catch {}
-        if (-not $path -or $path -match '\\AnthropicClaude\\app-') { return $false }
-        if ($StartedBefore -and (-not $start -or $start -ge $StartedBefore)) { return $false }
-        $true
-    })
-}
-
 # ---------- auto-switch selection ----------
 function Get-MaxUsed($Rows) {
     $m = 0.0

@@ -104,8 +104,6 @@ final class AppController: NSObject, ObservableObject, NSMenuDelegate, UNUserNot
     @Published var others: [OtherAccount] = []
     @Published var activeName: String?
     @Published var mismatch = false
-    @Published var oldSessions = 0
-    @Published var switchedFrom: String?
     @Published var backoffUntil = Date.distantPast
     @Published var backoffSec = 0
     @Published var tick = 0   // bumps every 30s so countdowns repaint
@@ -125,7 +123,6 @@ final class AppController: NSObject, ObservableObject, NSMenuDelegate, UNUserNot
     private var autoCooldownUntil = Date.distantPast
     private var autoNotified = false
     private var noticeStates: [String: [String: NoticeState]] = [:]
-    private var switchedAt: Date?
     private var quickRetries = 0
     private var profSig = ""
 
@@ -432,52 +429,26 @@ final class AppController: NSObject, ObservableObject, NSMenuDelegate, UNUserNot
 
     // MARK: switching
 
-    /// Call right after a switch; returns how many Claude Code sessions are still on the old login.
-    func registerSwitch(from: String?) -> Int {
-        switchedAt = Date()
-        switchedFrom = from
-        updateOldSessions()
-        return oldSessions
-    }
-
-    func updateOldSessions() {
-        guard let at = switchedAt else { oldSessions = 0; return }
-        oldSessions = claudeCodeProcesses(startedBefore: at).count
-        if oldSessions == 0 { switchedAt = nil }   // all restarted: done
-    }
-
-    func formatOldSessions(_ n: Int, _ from: String?) -> String {
-        guard n > 0 else { return "" }
-        return " \(n) running Claude Code \(n == 1 ? "session is" : "sessions are") still on \(from ?? "the old account"); restart \(n == 1 ? "it" : "them") to use the new account."
-    }
-
     /// Runs the switch on the worker queue (it may verify tokens over the network),
     /// then finishes on the main thread.
-    func performSwitch(_ id: String, completion: @escaping (Result<Profile, Error>, Int) -> Void) {
-        let from = activeName
+    func performSwitch(_ id: String, completion: @escaping (Result<Profile, Error>) -> Void) {
         let acc = self.acc
         worker.async {
             let result = Result { try acc.switchProfile(id) }
-            DispatchQueue.main.async {
-                var old = 0
-                if case .success = result { old = self.registerSwitch(from: from) }
-                completion(result, old)
-            }
+            DispatchQueue.main.async { completion(result) }
         }
     }
 
     func switchAccount(_ id: String) {
-        let from = activeName
         // Respect a manual choice: auto-switch won't override it for 5 minutes.
         autoCooldownUntil = Date().addingTimeInterval(300)
-        performSwitch(id) { result, old in
+        performSwitch(id) { result in
             switch result {
             case let .success(p):
                 self.activeName = p.name   // show it right away; numbers follow from the worker
                 self.rows = []; self.lastAcct = nil
                 self.updateUsage(full: true)
                 self.updateUI()
-                self.notify("Claude account switched", "New Claude Code sessions will use \(p.name)." + self.formatOldSessions(old, from))
             case let .failure(e):
                 self.notify("Switch failed", "\(e)")
             }
@@ -509,12 +480,12 @@ final class AppController: NSObject, ObservableObject, NSMenuDelegate, UNUserNot
         // covers stale numbers. Kept short so a nearly-spent account can hand off fast.
         autoCooldownUntil = Date().addingTimeInterval(60)
         autoNotified = false
-        performSwitch(target.id) { result, old in
+        performSwitch(target.id) { result in
             switch result {
             case .success:
                 self.activeName = target.name
                 self.notify("Claude auto-switched account",
-                            "\(from ?? "The active account") reached \(Int(used))% used. New Claude Code sessions will use \(target.name)." + self.formatOldSessions(old, from))
+                            "\(from ?? "The active account") reached \(Int(used))% used. Switched to \(target.name).")
                 self.requestRefresh(true)
             case let .failure(e):
                 self.notify("Claude auto-switch failed", "\(e)")
@@ -840,8 +811,6 @@ final class AppController: NSObject, ObservableObject, NSMenuDelegate, UNUserNot
 
     /// Every 30s: repaint countdowns, and pick up accounts added/switched elsewhere.
     func onTick() {
-        // Still waiting for old Claude Code sessions to be restarted? Re-count (local, cheap).
-        if switchedAt != nil { updateOldSessions() }
         if profilesChanged() {
             if settings.showAll { setOtherPlaceholders(acc.profiles(activeId: knownActiveId())) }
             updateUsage(full: true)

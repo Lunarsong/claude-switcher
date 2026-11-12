@@ -64,11 +64,6 @@ struct PopoverView: View {
                 .font(.system(size: 13, weight: .semibold))
                 .lineLimit(1).truncationMode(.tail)
 
-            if m.oldSessions > 0 {
-                Text("\(m.oldSessions) Claude Code \(m.oldSessions == 1 ? "session" : "sessions") still on \(m.switchedFrom ?? "the old account") – restart")
-                    .font(.system(size: 11)).foregroundColor(Self.warn).lineLimit(2)
-            }
-
             if m.rows.isEmpty {
                 Text(m.statusMessage).font(.system(size: 11)).foregroundColor(.secondary).lineLimit(3)
                     .padding(.vertical, 4)

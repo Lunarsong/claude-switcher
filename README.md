@@ -49,8 +49,6 @@ Click **All** on the overlay (or **Show all accounts** in the menu) to list usag
 
 With **All** on, other accounts are listed in auto-switch priority order. The one it would pick is tagged **NEXT**, and accounts it would skip show why: **SESSION FULL**, **WEEKLY FULL**, **LOW SESSION**, **LOW WEEKLY** or **ERROR**.
 
-**Running Claude Code sessions keep the old login until restarted**, so an auto-switch helps the next session you start, not one already in progress. After any switch, the overlay shows how many Claude Code sessions are still on the old account (for example "2 Claude Code sessions still on a@… – restart"), and the line goes away once they've all been restarted. It counts `claude.exe` processes from the CLI, IDE extensions and the desktop app's Code tab, and skips the desktop app's own windows. It never closes sessions for you.
-
 ### Switching
 
 In the overlay, the active account is always at the top: a tinted panel with a blue stripe and an **ACTIVE** label. Other accounts are dimmed below it, each with a **Switch** link. **Tray → Account** lists the active account first, in bold and marked "(active)"; click any other to switch. The same submenu has rename and "open profiles folder". From the CLI:
@@ -65,7 +63,7 @@ claude-profile rename <name> <new name>
 claude-profile remove <name>
 ```
 
-After switching, **restart any running Claude Code sessions**. A running session keeps the old login in memory and could write its refreshed tokens back over the switch. Before every switch, the previous `~/.claude.json` is kept as `~/.claude.json.switcher-backup`.
+Before every switch, the previous `~/.claude.json` is kept as `~/.claude.json.switcher-backup`.
 
 Profile folders contain live login tokens, so treat them like `~/.claude` itself: don't sync or share them.
 
@@ -142,6 +140,5 @@ On macOS, Claude Code keeps its tokens in the **login Keychain** (item `Claude C
 - saves only the Claude login in a profile. On a switch, it swaps only that part of Claude Code's Keychain item, so other logins kept there (such as MCP server sign-ins) stay as they are.
 - rewrites `~/.claude.json` with its key order, number formatting and file permissions unchanged, so a switch changes only the `oauthAccount` block. Run `claude-profile check-config` to confirm this for your file. It is read-only.
 - **Add account** (the **+** button) opens a small sign-in window instead of a terminal. In the background it runs `claude auth login` with a throwaway `CLAUDE_CONFIG_DIR`, and Claude Code opens your browser. Sign in there and the window shows **Account added** with **Switch to it** / **Keep current account**. If the browser doesn't open, or shows a code instead of finishing, use **Open sign-in page** and paste the code into the window. Claude Code puts the new login in a separate Keychain item (`Claude Code-credentials-<hash>`); the app imports it, then deletes that item and the temp folder. Closing the window cancels the sign-in. `claude-profile add` does the same in a terminal.
-- counts running Claude Code sessions (CLI, IDE extensions, the desktop app's Code tab) to show "N sessions still on the old account". It skips the desktop app's own processes, and detached `claude` processes whose terminal is gone.
 
 Settings, the rate-limit pause and `error.log` are kept in `~/Library/Application Support/ClaudeUsageTray/`.

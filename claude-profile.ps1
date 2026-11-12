@@ -28,14 +28,9 @@ function Show-List {
     }
 }
 
-# After a switch: confirm it and point out sessions still on the previous login.
+# After a switch: confirm it.
 function Write-SwitchResult([string]$Name) {
-    Write-Host "Switched to $Name. New Claude Code sessions will use it."
-    $old = @(Get-ClaudeCodeProcesses (Get-Date)).Count
-    if ($old -gt 0) {
-        $s, $it = if ($old -eq 1) { 'session is', 'it' } else { 'sessions are', 'them' }
-        Write-Host "$old running Claude Code $s still on the previous account; restart $it to use $Name." -ForegroundColor Yellow
-    }
+    Write-Host "Switched to $Name."
 }
 
 function Add-Account([string]$Name) {

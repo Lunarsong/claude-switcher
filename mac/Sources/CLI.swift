@@ -82,13 +82,9 @@ enum CLI {
         }
     }
 
-    /// After a switch: confirm it and point out sessions still on the previous login.
+    /// After a switch: confirm it.
     static func switchResult(_ name: String) {
-        say("Switched to \(name). New Claude Code sessions will use it.")
-        let old = claudeCodeProcesses(startedBefore: Date()).count
-        if old > 0 {
-            warn("\(old) running Claude Code \(old == 1 ? "session is" : "sessions are") still on the previous account; restart \(old == 1 ? "it" : "them") to use \(name).")
-        }
+        say("Switched to \(name).")
     }
 
     /// Runs an interactive command in this terminal and waits for it.

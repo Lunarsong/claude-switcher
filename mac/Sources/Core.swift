@@ -765,42 +765,6 @@ func usageNotices(_ rows: [UsageRow], state: inout [String: NoticeState], warnAt
     return notices
 }
 
-// MARK: - Running Claude Code sessions
-
-/// Claude Code sessions: processes whose executable is `claude` (CLI, IDE extensions,
-/// the desktop app's Code tab) or a native-installer build under .../claude/versions/.
-/// The desktop app's own processes (inside Claude.app) are excluded. `startedBefore`
-/// keeps only processes that were already running then (still on the previous login).
-func claudeCodeProcesses(startedBefore: Date? = nil) -> [Int32] {
-    let n = proc_listallpids(nil, 0)
-    guard n > 0 else { return [] }
-    var pids = [Int32](repeating: 0, count: Int(n) + 64)
-    let count = proc_listallpids(&pids, Int32(pids.count * MemoryLayout<Int32>.size))
-    guard count > 0 else { return [] }
-    var out: [Int32] = []
-    let me = getpid()
-    for pid in pids.prefix(Int(count)) where pid > 0 && pid != me {
-        var buf = [CChar](repeating: 0, count: 4096)
-        guard proc_pidpath(pid, &buf, UInt32(buf.count)) > 0 else { continue }
-        let path = String(cString: buf)
-        if path.contains("/Claude.app/") { continue }
-        let isClaude = (path as NSString).lastPathComponent == "claude" || path.contains("/claude/versions/")
-        guard isClaude else { continue }
-        var info = proc_bsdinfo()
-        let sz = Int32(MemoryLayout<proc_bsdinfo>.size)
-        guard proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, sz) == sz else { continue }
-        // Detached processes (parent is launchd) aren't sessions you can restart from a
-        // terminal or editor, e.g. leftovers whose window was closed; don't count them.
-        if info.pbi_ppid == 1 { continue }
-        if let before = startedBefore {
-            let started = Date(timeIntervalSince1970: TimeInterval(info.pbi_start_tvsec) + TimeInterval(info.pbi_start_tvusec) / 1e6)
-            if started >= before { continue }
-        }
-        out.append(pid)
-    }
-    return out
-}
-
 // MARK: - Auto-switch selection
 
 func maxUsed(_ rows: [UsageRow]) -> Double { rows.map(\.used).max().map { max(0, $0) } ?? 0 }

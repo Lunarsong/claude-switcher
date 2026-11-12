@@ -161,29 +161,7 @@ function Show-UsageNotices {
     $icon = if (@($n | Where-Object { $_.Kind -eq 'warn' })) { 'Warning' } else { 'Info' }
     $tray.ShowBalloonTip(8000, $title, ($lines -join "`n"), $icon)
 }
-$script:SwitchedAt        = $null # when we last switched (to spot sessions still on the old login)
-$script:SwitchedFrom      = $null
-$script:OldSessions       = 0
-
-# Call right after a switch; returns how many Claude Code sessions are still on the old login.
-function Register-Switch([string]$fromName) {
-    $script:SwitchedAt = Get-Date
-    $script:SwitchedFrom = $fromName
-    Update-OldSessions
-    return $script:OldSessions
-}
-function Update-OldSessions {
-    if (-not $script:SwitchedAt) { $script:OldSessions = 0; return }
-    $script:OldSessions = @(Get-ClaudeCodeProcesses $script:SwitchedAt).Count
-    if ($script:OldSessions -eq 0) { $script:SwitchedAt = $null }   # all restarted: done
-}
-function Format-OldSessions([int]$n, [string]$from) {
-    if ($n -le 0) { return '' }
-    $s = if ($n -eq 1) { 'session is' } else { 'sessions are' }
-    return (' {0} running Claude Code {1} still on {2}; restart them to use the new account.' -f $n, $s, $from)
-}
-# Header grows a line while old sessions are still running.
-function Get-HeaderH { if ($script:OldSessions -gt 0) { 60 } else { 44 } }
+$script:HeaderH = 44   # height of the active account's header (two text rows)
 
 # ---------- helpers ----------
 function Format-Until($when) {
@@ -460,15 +438,14 @@ function Invoke-AutoSwitch([bool]$OthersFresh) {
     # covers stale numbers. Kept short so a nearly-spent account can hand off fast.
     $script:AutoCooldownUntil = (Get-Date).AddMinutes(1)
     $script:AutoNotified = $false
-    $old = Register-Switch $from
     $script:ActiveName = $target.Name
     $tray.ShowBalloonTip(8000, 'Claude auto-switched account',
-        (("{0} reached {1}% used. New Claude Code sessions will use {2}." -f $from, [int]$used, $target.Name) + (Format-OldSessions $old $from)), 'Info')
+        ("{0} reached {1}% used. Switched to {2}." -f $from, [int]$used, $target.Name), 'Info')
     Request-Refresh $true
 }
 
 function Get-OverlayHeight {
-    $h = (Get-HeaderH) + [math]::Max(1, @($script:Rows).Count) * 34
+    $h = $script:HeaderH + [math]::Max(1, @($script:Rows).Count) * 34
     if ($Settings.ShowAll) {
         $h += 6    # gap below the active panel
         if (-not $script:Others) { $h += 20 }
@@ -671,16 +648,13 @@ function Set-ShowAll([bool]$on) {
 
 function Invoke-SwitchAccount($id) {
     try {
-        $from = $script:ActiveName
         $p = Switch-ClaudeProfile $id
         # Respect a manual choice: auto-switch won't override it for 5 minutes.
         $script:AutoCooldownUntil = (Get-Date).AddMinutes(5)
-        $old = Register-Switch $from
         $script:ActiveName = $p.Name    # show it right away; numbers follow from the worker
         $script:Rows = @(); $script:LastAcct = $null
         Update-Usage -Full
         Update-Ui
-        $tray.ShowBalloonTip(6000, 'Claude account switched', ("New Claude Code sessions will use $($p.Name)." + (Format-OldSessions $old $from)), 'Info')
     } catch {
         $tray.ShowBalloonTip(5000, 'Switch failed', $_.Exception.Message, 'Error')
     }
@@ -784,7 +758,7 @@ $overlay.Add_Paint({
     $cf.Alignment = 'Center'; $cf.LineAlignment = 'Center'
 
     # ---- Active account block: always on top, tinted panel + accent stripe ----
-    $headerH = Get-HeaderH
+    $headerH = $script:HeaderH
     $activeH = $headerH + [math]::Max(1, @($script:Rows).Count) * 34 - 4
     $g.FillRectangle($activeBgBr, 0, 0, $w, $activeH)
     $g.FillRectangle($accentBr, 0, 0, 3, $activeH)
@@ -817,13 +791,6 @@ $overlay.Add_Paint({
     # Row 2: account name, full width
     $title = if ($script:ActiveName) { $script:ActiveName } else { 'Claude usage' }
     $g.DrawString($title, $fontTitle, $fgMain, (New-Object System.Drawing.RectangleF(10, 24, ($w - 18), 16)), $tf)
-
-    # Row 3 (only after a switch): sessions still running on the old login
-    if ($script:OldSessions -gt 0) {
-        $s = if ($script:OldSessions -eq 1) { 'session' } else { 'sessions' }
-        $msg = '{0} Claude Code {1} still on {2} - restart' -f $script:OldSessions, $s, $script:SwitchedFrom
-        $g.DrawString($msg, $fontSmall, $warnBr, (New-Object System.Drawing.RectangleF(10, 41, ($w - 18), 15)), $tf)
-    }
 
     $y = $headerH
     if (-not $script:Rows) {
@@ -1004,12 +971,6 @@ $addWatch.Add_Tick({
 $tickTimer = New-Object System.Windows.Forms.Timer
 $tickTimer.Interval = 30000
 $tickTimer.Add_Tick({
-    # Still waiting for old Claude Code sessions to be restarted? Re-count (local, cheap).
-    if ($script:SwitchedAt) {
-        $before = $script:OldSessions
-        Update-OldSessions
-        if ($script:OldSessions -ne $before) { Update-Ui }   # height may change
-    }
     if (Test-ProfilesChanged) {
         if ($Settings.ShowAll) { Set-OtherPlaceholders (Get-ClaudeProfiles (Get-KnownActive)) }
         Update-Usage -Full
