@@ -48,7 +48,8 @@ $CredPath     = Join-Path $env:USERPROFILE '.claude\.credentials.json'
 $UsageUrl     = 'https://api.anthropic.com/api/oauth/usage'
 $SettingsDir  = Join-Path $env:APPDATA 'ClaudeUsageTray'
 $SettingsPath = Join-Path $SettingsDir 'settings.json'
-$StartupLnk   = Join-Path ([Environment]::GetFolderPath('Startup')) 'Claude Usage Tray.lnk'
+$StartupLnk   = Join-Path ([Environment]::GetFolderPath('Startup')) 'Claude Usage Tray.lnk'   # old autostart method
+$AutostartTask = 'Claude Usage Tray'
 $Launcher     = Join-Path $PSScriptRoot 'start-usage-tray.vbs'
 $ProfileCli   = Join-Path $PSScriptRoot 'claude-profile.ps1'
 . (Join-Path $PSScriptRoot 'ClaudeProfiles.ps1')
@@ -68,6 +69,45 @@ if (Test-Path $SettingsPath) {
 function Save-Settings {
     if (-not (Test-Path $SettingsDir)) { New-Item -ItemType Directory $SettingsDir | Out-Null }
     $Settings | ConvertTo-Json | Set-Content $SettingsPath -Encoding UTF8
+}
+
+# ---------- start with Windows ----------
+# A per-user scheduled task that runs at sign-in. Startup-folder shortcuts are
+# launched one at a time *after* every other startup app (minutes on a busy PC);
+# a sign-in task starts right away. No admin rights needed. Falls back to the
+# Startup folder if the task can't be created.
+function Test-Autostart {
+    [bool](Get-ScheduledTask -TaskName $AutostartTask -ErrorAction SilentlyContinue) -or (Test-Path $StartupLnk)
+}
+function Enable-Autostart {
+    $me = "$env:USERDOMAIN\$env:USERNAME"
+    $wscript = Join-Path $env:WINDIR 'System32\wscript.exe'
+    try {
+        $action    = New-ScheduledTaskAction -Execute $wscript -Argument "`"$Launcher`"" -WorkingDirectory $PSScriptRoot
+        $trigger   = New-ScheduledTaskTrigger -AtLogOn -User $me
+        # Laptops: start and keep running on battery; never time out.
+        $settings  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+                        -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew
+        $principal = New-ScheduledTaskPrincipal -UserId $me -LogonType Interactive -RunLevel Limited
+        Register-ScheduledTask -TaskName $AutostartTask -Action $action -Trigger $trigger -Settings $settings `
+            -Principal $principal -Description 'Starts the Claude usage tray when you sign in.' -Force | Out-Null
+        if (Test-Path $StartupLnk) { Remove-Item $StartupLnk -Force }   # don't start twice
+        return $true
+    } catch {
+        try { Add-Content $LogPath ("{0}  autostart task: {1}" -f (Get-Date -Format s), $_.Exception.Message) } catch {}
+        $lnk = (New-Object -ComObject WScript.Shell).CreateShortcut($StartupLnk)
+        $lnk.TargetPath = $wscript; $lnk.Arguments = "`"$Launcher`""; $lnk.WorkingDirectory = $PSScriptRoot
+        $lnk.Save()
+        return $false
+    }
+}
+function Disable-Autostart {
+    Unregister-ScheduledTask -TaskName $AutostartTask -Confirm:$false -ErrorAction SilentlyContinue
+    if (Test-Path $StartupLnk) { Remove-Item $StartupLnk -Force }
+}
+# Older versions used the Startup folder: move those to the faster sign-in task.
+if ((Test-Path $StartupLnk) -and -not (Get-ScheduledTask -TaskName $AutostartTask -ErrorAction SilentlyContinue)) {
+    Enable-Autostart | Out-Null
 }
 
 # ---------- state ----------
@@ -331,7 +371,13 @@ function Apply-Result($r) {
         Update-Ui
         return
     }
-    if ($r.Err) { $script:LastErr = $r.Err } else {
+    if ($r.Err) {
+        $script:LastErr = $r.Err
+        # Starting at sign-in often means no network yet: retry every 20s (up to ~3 min)
+        # instead of waiting a full check interval with nothing to show.
+        if (-not $script:Rows -and $script:QuickRetries -lt 9) { $script:QuickRetries++; $retryTimer.Start() }
+    } else {
+        $script:QuickRetries = 0
         $script:Rows = $r.Rows; $script:LastErr = $null; $script:LastOk = Get-Date
         Clear-Backoff
         if (-not $script:Mismatch) { Show-UsageNotices }
@@ -501,7 +547,7 @@ $miRefresh = $menu.Items.Add('Refresh now')
 $miWeb     = $menu.Items.Add('Open claude.ai usage page')
 $miStartup = $menu.Items.Add('Start with Windows')
 $miStartup.CheckOnClick = $true
-$miStartup.Checked = Test-Path $StartupLnk
+$miStartup.Checked = Test-Autostart
 $miShowAll = $menu.Items.Add('Show all accounts')
 $miShowAll.Checked = [bool]$Settings.ShowAll
 $miRemain  = $menu.Items.Add('Show remaining instead of used')
@@ -853,15 +899,11 @@ $miShowAll.Add_Click({ Set-ShowAll (-not $Settings.ShowAll) })
 $miWeb.Add_Click({ Start-Process 'https://claude.ai/settings/usage' })
 $miStartup.Add_CheckedChanged({
     if ($miStartup.Checked) {
-        $sh = New-Object -ComObject WScript.Shell
-        $lnk = $sh.CreateShortcut($StartupLnk)
-        $lnk.TargetPath = Join-Path $env:WINDIR 'System32\wscript.exe'
-        $lnk.Arguments = '"' + $Launcher + '"'
-        $lnk.WorkingDirectory = $PSScriptRoot
-        $lnk.Save()
-    } elseif (Test-Path $StartupLnk) {
-        Remove-Item $StartupLnk
-    }
+        if (-not (Enable-Autostart)) {
+            $tray.ShowBalloonTip(6000, 'Start with Windows',
+                'Could not create the sign-in task, so a Startup-folder shortcut was used instead. Windows may start it a few minutes after sign-in.', 'Warning')
+        }
+    } else { Disable-Autostart }
 })
 $tray.Add_MouseClick({
     param($s, $e)
@@ -899,6 +941,12 @@ function Get-KnownActive {
     } catch {}
     return $null
 }
+
+# One-shot quick retry while we have no numbers at all (see Apply-Result).
+$script:QuickRetries = 0
+$retryTimer = New-Object System.Windows.Forms.Timer
+$retryTimer.Interval = 20000
+$retryTimer.Add_Tick({ $retryTimer.Stop(); Update-Usage })
 
 # Polls the background worker (cheap; only runs while a check is in flight).
 $jobWatch = New-Object System.Windows.Forms.Timer

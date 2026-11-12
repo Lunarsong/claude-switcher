@@ -6,6 +6,7 @@ A Windows tray icon and a small always-on-top overlay that show how much of your
 - **Overlay:** one bar per limit: the 5-hour session, weekly, and per-model weekly (such as "Weekly Fable"). Like claude.ai, bars start empty and fill as you use them, with the % used and time until reset. Turn on **Show remaining instead of used** in the menu to flip this. Drag the overlay to move it (its position is saved), and double-click it to refresh.
 - New, removed or switched accounts are picked up automatically within 30 seconds, including ones changed from the CLI.
 - **Right-click menu** (tray or overlay): Show overlay, Refresh now, Check usage every, Open claude.ai usage page, Start with Windows, Notifications, Auto-switch, Account, Exit. Left-clicking the tray icon toggles the overlay.
+- **Start with Windows** registers a per-user scheduled task named "Claude Usage Tray" that runs at sign-in, so the tray appears within seconds; no admin rights are needed. Startup-folder shortcuts (used by older versions, and migrated automatically) only run after every other startup app, which can take minutes. If the network isn't up yet, the tray retries every 20 seconds until it gets numbers.
 - Text is drawn at your screen's real resolution, so it stays sharp at any Windows display scaling.
 
 ### Notifications
