@@ -1,6 +1,6 @@
 # Claude Usage Tray
 
-A Windows tray icon and a small always-on-top overlay that show how much of your Claude subscription limits you have left.
+A Windows tray icon and a small always-on-top overlay that show how much of your Claude subscription limits you have left. There is also a native **macOS** version that lives in the menu bar; see [macOS](#macos) below.
 
 - **Tray icon:** a coloured circle showing the % used on your *tightest* limit. It's green while under 70% used, amber at 70–90%, red above 90%, and grey when the data is stale or there was an error. Hover over it for every limit.
 - **Overlay:** one bar per limit: the 5-hour session, weekly, and per-model weekly (such as "Weekly Fable"). Like claude.ai, bars start empty and fill as you use them, with the % used and time until reset. Turn on **Show remaining instead of used** in the menu to flip this. Drag the overlay to move it (its position is saved), and double-click it to refresh.
@@ -106,3 +106,42 @@ It authenticates with the OAuth token Claude Code keeps in `%USERPROFILE%\.claud
 Settings (overlay position, check intervals, auto-switch rules, `Opacity`) are stored in `%APPDATA%\ClaudeUsageTray\settings.json`. Errors are logged to `error.log` in the same folder.
 
 Note: this endpoint is not a documented public API, so a future Claude Code release could change it.
+
+## macOS
+
+A native menu-bar version lives in `mac/`. It has the same features as the Windows tray: the same usage numbers, account switching, auto-switch rules, notifications and `claude-profile` commands.
+
+- **Menu bar:** a coloured dot and the % used on your *tightest* limit (`● 23%`), next to the battery and Wi-Fi icons. The colours match Windows: green, amber, red, and grey when the data is stale. Hover over it for every limit.
+- **Left-click** opens a panel that replaces the Windows overlay. It has one bar per limit, the active account on top, and with **All** on, every other saved account with a **Switch** button. The header buttons are refresh, **All**, **+** (add an account) and **⋯** (settings).
+- **Right-click** (or the **⋯** button) opens the menu: Refresh now, Check usage every, Open claude.ai usage page, Start at login, Show all accounts, Show remaining instead of used, Notifications, Auto-switch, Account, Quit.
+- **Start at login** adds a per-user LaunchAgent (`~/Library/LaunchAgents/local.claude-switcher.usage-tray.plist`). No admin rights are needed. If you move the app, the path is updated the next time it runs.
+
+### Build and run
+
+```
+mac/build.sh              # builds mac/build/Claude Usage Tray.app
+open "mac/build/Claude Usage Tray.app"
+mac/build.sh install      # optional: also copies it to ~/Applications
+mac/build.sh test         # runs the tests
+```
+
+It needs only the Xcode command-line tools (`xcode-select --install`) and macOS 13 or later. Nothing is downloaded. The app is signed ad hoc, for your own Mac only.
+
+`mac/claude-profile` is the same command line as on Windows (`list`, `add`, `use`, `usage`, `save`, `rename`, `remove`). To put it on your PATH:
+
+```
+ln -s "$PWD/mac/claude-profile" ~/.local/bin/claude-profile
+```
+
+### Where things live on a Mac
+
+On macOS, Claude Code keeps its tokens in the **login Keychain** (item `Claude Code-credentials`), not in `~/.claude/.credentials.json`. Account details are still in `~/.claude.json`. The Mac version:
+
+- reads and writes that Keychain item through `/usr/bin/security`, the same way Claude Code does. That item already trusts `security`, so reading it and saving profiles shows no Keychain prompt (switching uses the same path). If the Keychain item doesn't exist, it uses Claude Code's plaintext fallback file, `~/.claude/.credentials.json`.
+- keeps each saved profile's tokens in the Keychain too (item `Claude Usage Tray`, one per account), never in files. `~/Library/Application Support/ClaudeUsageTray/profiles/<id>/` holds only the name and account details.
+- saves only the Claude login in a profile. On a switch, it swaps only that part of Claude Code's Keychain item, so other logins kept there (such as MCP server sign-ins) stay as they are.
+- rewrites `~/.claude.json` with its key order, number formatting and file permissions unchanged, so a switch changes only the `oauthAccount` block. Run `claude-profile check-config` to confirm this for your file. It is read-only.
+- **Add account** (the **+** button) opens a small sign-in window instead of a terminal. In the background it runs `claude auth login` with a throwaway `CLAUDE_CONFIG_DIR`, and Claude Code opens your browser. Sign in there and the window shows **Account added** with **Switch to it** / **Keep current account**. If the browser doesn't open, or shows a code instead of finishing, use **Open sign-in page** and paste the code into the window. Claude Code puts the new login in a separate Keychain item (`Claude Code-credentials-<hash>`); the app imports it, then deletes that item and the temp folder. Closing the window cancels the sign-in. `claude-profile add` does the same in a terminal.
+- counts running Claude Code sessions (CLI, IDE extensions, the desktop app's Code tab) to show "N sessions still on the old account". It skips the desktop app's own processes, and detached `claude` processes whose terminal is gone.
+
+Settings, the rate-limit pause and `error.log` are kept in `~/Library/Application Support/ClaudeUsageTray/`.

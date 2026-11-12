@@ -1,0 +1,11 @@
+#!/bin/zsh
+# claude-profile for macOS: runs the command line built into the menu-bar app.
+# Put it on your PATH, e.g.:  ln -s "$PWD/mac/claude-profile" ~/.local/bin/claude-profile
+here="${0:A:h}"
+for app in "$here/build/Claude Usage Tray.app" "$HOME/Applications/Claude Usage Tray.app" "/Applications/Claude Usage Tray.app"; do
+  if [[ -x "$app/Contents/MacOS/ClaudeUsageTray" ]]; then
+    exec "$app/Contents/MacOS/ClaudeUsageTray" --cli "$@"
+  fi
+done
+echo "Claude Usage Tray isn't built yet. Run: $here/build.sh" >&2
+exit 1
