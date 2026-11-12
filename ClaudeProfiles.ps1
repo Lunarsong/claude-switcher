@@ -165,22 +165,60 @@ function Get-PriorityReset($Rows) {
     return ($pool | ForEach-Object { $_.Resets.ToUniversalTime() } | Sort-Object | Select-Object -First 1)
 }
 
-# Others ordered for switching: eligible accounts (every limit <= 100-MinLeft used)
-# first, soonest reset first, then most headroom; ineligible/errored after.
-# Each entry gets .Eligible set.
-function Sort-SwitchCandidates($Others, [double]$MinLeft) {
-    $limit = 100 - $MinLeft
-    foreach ($o in @($Others)) {
-        $o.Eligible = (-not $o.Err) -and @($o.Rows).Count -gt 0 -and ((Get-MaxUsed $o.Rows) -le $limit)
+# Switch rules (hashtable):
+#   FullAt     - an account is "full" when any limit is at/above this % used.
+#                Targets must never be full (else we'd switch straight off them).
+#   MinSession - target's session (5h) limit needs at least this % left.
+#                A maxed session makes an account useless right now.
+#   MinWeekly  - target's weekly limits need at least this % left (0 = any,
+#                so a nearly-spent weekly allowance still gets used up).
+#   Prefer     - 'reset': soonest weekly reset first (use it before it expires)
+#                'room' : most room left first
+function New-SwitchRules($FullAt = 99, $MinSession = 10, $MinWeekly = 0, $Prefer = 'reset') {
+    return @{ FullAt = [double]$FullAt; MinSession = [double]$MinSession; MinWeekly = [double]$MinWeekly; Prefer = [string]$Prefer }
+}
+
+# Why an account can't be switched to, or $null if it can.
+function Get-IneligibleReason($o, $Rules) {
+    if ($o.Err) { return 'ERROR' }
+    if (-not @($o.Rows).Count) { return 'NO DATA' }
+    foreach ($r in $o.Rows) {
+        $left = 100 - [double]$r.Used
+        $isSession = $r.Label -like 'Session*'
+        if ([double]$r.Used -ge $Rules.FullAt) { if ($isSession) { return 'SESSION FULL' } else { return 'WEEKLY FULL' } }
+        if ($isSession -and $left -lt $Rules.MinSession) { return 'LOW SESSION' }
+        if (-not $isSession -and $left -lt $Rules.MinWeekly) { return 'LOW WEEKLY' }
     }
-    $eligible = @($Others | Where-Object { $_.Eligible } | Sort-Object @{ e = { Get-PriorityReset $_.Rows } }, @{ e = { Get-MaxUsed $_.Rows } })
+    return $null
+}
+
+# Least room left on any weekly limit (used for the 'room' preference).
+function Get-WeeklyLeft($Rows) {
+    $w = @($Rows | Where-Object { $_.Label -notlike 'Session*' })
+    if (-not $w) { $w = @($Rows) }
+    return (100 - (Get-MaxUsed $w))
+}
+
+# Others ordered for switching: eligible first (by preference), then the rest.
+# Sets .Eligible and .Reason on each entry.
+function Sort-SwitchCandidates($Others, $Rules) {
+    foreach ($o in @($Others)) {
+        $o.Reason = Get-IneligibleReason $o $Rules
+        $o.Eligible = -not $o.Reason
+    }
+    $keys = if ($Rules.Prefer -eq 'room') {
+        @(@{ e = { Get-WeeklyLeft $_.Rows }; Descending = $true }, @{ e = { Get-PriorityReset $_.Rows }; Descending = $false })
+    } else {
+        @(@{ e = { Get-PriorityReset $_.Rows }; Descending = $false }, @{ e = { Get-WeeklyLeft $_.Rows }; Descending = $true })
+    }
+    $eligible = @($Others | Where-Object { $_.Eligible } | Sort-Object $keys)
     $rest     = @($Others | Where-Object { -not $_.Eligible })
     return ,@($eligible + $rest)
 }
 
 # The account to switch to, or $null. Does not check whether a switch is due.
-function Select-AutoSwitchTarget($Others, [double]$MinLeft) {
-    $sorted = Sort-SwitchCandidates $Others $MinLeft
+function Select-AutoSwitchTarget($Others, $Rules) {
+    $sorted = Sort-SwitchCandidates $Others $Rules
     $first = $sorted | Select-Object -First 1
     if ($first -and $first.Eligible) { return $first }
     return $null

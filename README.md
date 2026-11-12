@@ -30,14 +30,15 @@ Click **All** on the overlay (or **Show all accounts** in the menu) to list usag
 
 **Tray → Auto-switch → Enabled** (off by default) switches accounts for you when the active account runs out:
 
-- **Switch when any limit reaches:** 90 / 95 / **99** / 100 % used. This covers the session, weekly and per-model limits.
-- **Only to accounts with at least:** 5 / **10** / 20 / 30 / 50 % left on *every* limit. An account with a fresh weekly limit but a maxed-out session is skipped.
-- **Priority:** among eligible accounts, the one whose weekly limit **resets soonest** wins, so that allowance gets used before it expires. Ties go to the account with the most headroom.
-- If no account qualifies, you get a single warning, and it doesn't repeat until usage drops and rises again.
-- After any switch, auto or manual, auto-switch waits 5 minutes, so it never ping-pongs and doesn't override a choice you just made.
+- **Switch away when any limit reaches:** 90 / 95 / **99** / 100 % used. This covers the session, weekly and per-model limits. An account at or past this point counts as **full**, and is never switched *to*.
+- **Target needs session (5h) left:** Any / 5 / **10** / 25 / 50 %. A maxed-out session makes an account useless right now, so by default the target needs at least 10% of its session left.
+- **Target needs weekly left:** **Any** / 5 / 10 / 25 %. The default is any (just not full), so an account with only 4% of its weekly allowance left still gets used up instead of wasted.
+- **Prefer:** **Soonest weekly reset** (spend allowance before it expires) or **Most weekly room left**. The other option breaks ties.
+- If no account qualifies, you get a single warning that says why for each account, and it doesn't repeat until usage drops and rises again.
+- After an auto-switch it waits 1 minute; after a manual switch, 5 minutes, so it doesn't override a choice you just made. Since targets are never full, it can't ping-pong.
 - Usage is checked every 2 minutes, so a fast session can pass the threshold before the switch happens.
 
-With **All** on, other accounts are listed in auto-switch priority order. The one it would pick is tagged **NEXT**.
+With **All** on, other accounts are listed in auto-switch priority order. The one it would pick is tagged **NEXT**, and accounts it would skip show why: **SESSION FULL**, **WEEKLY FULL**, **LOW SESSION**, **LOW WEEKLY** or **ERROR**.
 
 **Running Claude Code sessions keep the old login until restarted**, so an auto-switch helps the next session you start, not one already in progress.
 

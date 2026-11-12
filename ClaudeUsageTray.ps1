@@ -71,7 +71,13 @@ if ($null -eq $Settings.ShowAll) { $Settings.ShowAll = $false }
 if ($null -eq $Settings.ShowRemaining) { $Settings.ShowRemaining = $false }
 if ($null -eq $Settings.AutoSwitch)        { $Settings.AutoSwitch = $false }
 if ($null -eq $Settings.AutoSwitchAt)      { $Settings.AutoSwitchAt = 99 }    # switch when any limit hits this % used
-if ($null -eq $Settings.AutoSwitchMinLeft) { $Settings.AutoSwitchMinLeft = 10 } # target needs >= this % left on every limit
+if ($null -eq $Settings.AutoSwitchMinSession) { $Settings.AutoSwitchMinSession = 10 }   # target's 5h session needs >= this % left
+if ($null -eq $Settings.AutoSwitchMinWeekly)  { $Settings.AutoSwitchMinWeekly = 0 }     # target's weekly limits need >= this % left (0 = any)
+if ($null -eq $Settings.AutoSwitchPrefer)     { $Settings.AutoSwitchPrefer = 'reset' }  # 'reset' | 'room'
+if ($Settings.Contains('AutoSwitchMinLeft'))  { $Settings.Remove('AutoSwitchMinLeft') }  # replaced by the two above
+function Get-SwitchRules {
+    New-SwitchRules $Settings.AutoSwitchAt $Settings.AutoSwitchMinSession $Settings.AutoSwitchMinWeekly $Settings.AutoSwitchPrefer
+}
 $script:AutoCooldownUntil = [datetime]::MinValue
 $script:AutoNotified      = $false
 $script:SwitchRects       = @()   # clickable account names in the overlay: @{ Rect; Id }
@@ -137,7 +143,7 @@ function Update-OtherAccounts {
         $list += $entry
     }
     # Order = auto-switch priority, so the top one is "next up".
-    $script:Others = Sort-SwitchCandidates $list ([double]$Settings.AutoSwitchMinLeft)
+    $script:Others = Sort-SwitchCandidates $list (Get-SwitchRules)
 }
 
 # Returns $true if it switched accounts.
@@ -148,11 +154,13 @@ function Invoke-AutoSwitch {
     if ((Get-Date) -lt $script:AutoCooldownUntil) { return $false }
 
     if (-not $Settings.ShowAll) { Update-OtherAccounts }   # need fresh numbers to choose
-    $target = Select-AutoSwitchTarget $script:Others ([double]$Settings.AutoSwitchMinLeft)
+    $target = Select-AutoSwitchTarget $script:Others (Get-SwitchRules)
     if (-not $target) {
         if (-not $script:AutoNotified) {
+            $why = ($script:Others | ForEach-Object { '{0}: {1}' -f $_.Name, $_.Reason }) -join '; '
+            if (-not $why) { $why = 'no other saved accounts' }
             $tray.ShowBalloonTip(6000, 'Claude auto-switch',
-                ("Current account is at {0}% but no other account has {1}% left on every limit." -f [int]$used, $Settings.AutoSwitchMinLeft), 'Warning')
+                ("Current account is at {0}% but no other account qualifies ({1})." -f [int]$used, $why), 'Warning')
             $script:AutoNotified = $true
         }
         return $false
@@ -162,7 +170,9 @@ function Invoke-AutoSwitch {
     try { Switch-ClaudeProfile $target.Id | Out-Null } catch {
         $tray.ShowBalloonTip(6000, 'Claude auto-switch failed', $_.Exception.Message, 'Error'); return $false
     }
-    $script:AutoCooldownUntil = (Get-Date).AddMinutes(5)   # no ping-ponging
+    # Targets are never "full", so ping-pong can't happen; a short guard just
+    # covers stale numbers. Kept short so a nearly-spent account can hand off fast.
+    $script:AutoCooldownUntil = (Get-Date).AddMinutes(1)
     $script:AutoNotified = $false
     $tray.ShowBalloonTip(8000, 'Claude auto-switched account',
         ("{0} reached {1}% used. Now using {2}. Restart running Claude Code sessions to pick it up." -f $from, [int]$used, $target.Name), 'Info')
@@ -288,13 +298,14 @@ $miAutoOn.Add_CheckedChanged({
 $miAuto.DropDownItems.Add($miAutoOn) | Out-Null
 $miAuto.DropDownItems.Add('-') | Out-Null
 
-function Add-RadioGroup($parent, [string]$heading, [int[]]$values, [string]$fmt, [string]$key) {
+# $options: array of @(value, label). Clicking one stores the value under $key.
+function Add-RadioGroup($parent, [string]$heading, $options, [string]$key) {
     $h = $parent.DropDownItems.Add($heading); $h.Enabled = $false
     $items = @()
-    foreach ($v in $values) {
-        $it = New-Object System.Windows.Forms.ToolStripMenuItem ($fmt -f $v)
-        $it.Tag = @{ Key = $key; Value = $v }
-        $it.Checked = ([int]$Settings[$key] -eq $v)
+    foreach ($opt in $options) {
+        $it = New-Object System.Windows.Forms.ToolStripMenuItem ('   ' + $opt[1])
+        $it.Tag = @{ Key = $key; Value = $opt[0] }
+        $it.Checked = ([string]$Settings[$key] -eq [string]$opt[0])
         $parent.DropDownItems.Add($it) | Out-Null
         $items += $it
     }
@@ -305,16 +316,19 @@ function Add-RadioGroup($parent, [string]$heading, [int[]]$values, [string]$fmt,
             foreach ($sib in $s.Owner.Items) {
                 if ($sib.Tag -is [hashtable] -and $sib.Tag.Key -eq $s.Tag.Key) { $sib.Checked = ($sib -eq $s) }
             }
-            if ($s.Tag.Key -eq 'AutoSwitchMinLeft' -and $script:Others) {
-                $script:Others = Sort-SwitchCandidates $script:Others ([double]$Settings.AutoSwitchMinLeft)
-            }
+            # Re-rank with the new rules so NEXT / reasons update immediately.
+            if ($script:Others) { $script:Others = Sort-SwitchCandidates $script:Others (Get-SwitchRules) }
             Update-Ui
         })
     }
 }
-Add-RadioGroup $miAuto 'Switch when any limit reaches' @(90, 95, 99, 100) '   {0}% used' 'AutoSwitchAt'
+Add-RadioGroup $miAuto 'Switch away when any limit reaches' @(@(90, '90% used'), @(95, '95% used'), @(99, '99% used'), @(100, '100% used')) 'AutoSwitchAt'
 $miAuto.DropDownItems.Add('-') | Out-Null
-Add-RadioGroup $miAuto 'Only to accounts with at least' @(5, 10, 20, 30, 50) '   {0}% left on every limit' 'AutoSwitchMinLeft'
+Add-RadioGroup $miAuto 'Target needs session (5h) left' @(@(0, 'Any (just not full)'), @(5, '5%'), @(10, '10%'), @(25, '25%'), @(50, '50%')) 'AutoSwitchMinSession'
+$miAuto.DropDownItems.Add('-') | Out-Null
+Add-RadioGroup $miAuto 'Target needs weekly left' @(@(0, 'Any (just not full)'), @(5, '5%'), @(10, '10%'), @(25, '25%')) 'AutoSwitchMinWeekly'
+$miAuto.DropDownItems.Add('-') | Out-Null
+Add-RadioGroup $miAuto 'Prefer' @(@('reset', 'Soonest weekly reset (use it before it expires)'), @('room', 'Most weekly room left')) 'AutoSwitchPrefer'
 
 $miAccount = New-Object System.Windows.Forms.ToolStripMenuItem 'Account'
 $menu.Items.Add($miAccount) | Out-Null
@@ -419,6 +433,7 @@ $btnBr   = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArg
 $btnOnBr = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(70, 95, 160))
 $accentBr   = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(110, 155, 255))
 $activeBgBr = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(38, 42, 56))
+$warnBr     = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(225, 120, 110))
 $fontTag    = New-Object System.Drawing.Font('Segoe UI', 6.75, [System.Drawing.FontStyle]::Bold)
 
 $overlay.Add_Paint({
@@ -481,9 +496,15 @@ $overlay.Add_Paint({
             $script:SwitchRects += @{ Rect = $link; Id = $o.Id }
             $g.DrawString('Switch', $fontSmall, $accentBr, [System.Drawing.RectangleF]$link, $cf)
             $nameW = $w - 64
-            if ($first -and $o.Eligible -and $Settings.AutoSwitch) {
-                $g.DrawString('NEXT', $fontTag, $accentBr, ($w - 82), ($y + 2))
-                $nameW = $w - 96
+            $tag = $null; $tagBr = $accentBr
+            if ($Settings.AutoSwitch) {
+                if ($first -and $o.Eligible) { $tag = 'NEXT' }
+                elseif ($o.Reason) { $tag = $o.Reason; $tagBr = $warnBr }
+            }
+            if ($tag) {
+                $tsz = $g.MeasureString($tag, $fontTag)
+                $g.DrawString($tag, $fontTag, $tagBr, ($w - 54 - $tsz.Width), ($y + 2))
+                $nameW = $w - 60 - $tsz.Width - 4
             }
             $g.DrawString($o.Name, $fontRow, $fgDim, (New-Object System.Drawing.RectangleF(10, $y, $nameW, 16)), $tf)
             $first = $false
