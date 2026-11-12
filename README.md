@@ -36,7 +36,7 @@ Click **All** on the overlay (or **Show all accounts** in the menu) to list usag
 - **Prefer:** **Soonest weekly reset** (spend allowance before it expires) or **Most weekly room left**. The other option breaks ties.
 - If no account qualifies, you get a single warning that says why for each account, and it doesn't repeat until usage drops and rises again.
 - After an auto-switch it waits 1 minute; after a manual switch, 5 minutes, so it doesn't override a choice you just made. Since targets are never full, it can't ping-pong.
-- Usage is checked every 2 minutes, so a fast session can pass the threshold before the switch happens.
+- The active account is checked every minute by default, so a very fast session can still pass the threshold before the switch happens. A lower threshold (such as 95%) gives more margin.
 
 With **All** on, other accounts are listed in auto-switch priority order. The one it would pick is tagged **NEXT**, and accounts it would skip show why: **SESSION FULL**, **WEEKLY FULL**, **LOW SESSION**, **LOW WEEKLY** or **ERROR**.
 
@@ -72,8 +72,16 @@ It needs only Windows PowerShell 5.1, which is built in. There are no other depe
 
 ## How it works
 
-It polls `https://api.anthropic.com/api/oauth/usage` every 2 minutes. This is the same data Claude Code's `/usage` shows. It authenticates with the OAuth token Claude Code keeps in `%USERPROFILE%\.claude\.credentials.json` and re-reads the token on every poll. If the token expires, the icon turns grey. Open Claude Code once to refresh the token.
+It polls `https://api.anthropic.com/api/oauth/usage`, the same data Claude Code's `/usage` shows. Set the timing under **Tray → Check usage every**:
 
-Settings (overlay position, `IntervalSec`, `Opacity`) are stored in `%APPDATA%\ClaudeUsageTray\settings.json`. Errors are logged to `error.log` in the same folder.
+- **Active account:** every **1 minute** by default (30 seconds to 5 minutes). This drives auto-switch.
+- **Other accounts:** every **10 minutes** by default (5 to 30 minutes), and only while **All** is on. Auto-switch always re-checks them right before choosing.
+- **Refresh now** or double-clicking the overlay checks everything immediately.
+
+The endpoint is rate-limited. If Anthropic answers *429 Too Many Requests*, the tray keeps showing the last numbers, marks them stale, and pauses: for the server's `Retry-After` time if given, otherwise for 2 minutes, doubling up to 15 minutes. Auto-switch is paused while rate-limited.
+
+**Login safety:** Claude Code stores tokens and account details in separate files, and a Claude Code session still running on an old account can rewrite the tokens after a switch. So the tray checks who a token really belongs to (`api/oauth/profile`, cached per token) before saving it into a profile. If the files disagree, it saves the tokens only to their real owner's profile, shows **LOGIN OVERWRITTEN** on the overlay with a notification, and pauses auto-switch. Close the running Claude Code sessions and switch again; switching rewrites both files and clears the warning. It authenticates with the OAuth token Claude Code keeps in `%USERPROFILE%\.claude\.credentials.json` and re-reads the token on every poll. If the token expires, the icon turns grey. Open Claude Code once to refresh the token.
+
+Settings (overlay position, check intervals, auto-switch rules, `Opacity`) are stored in `%APPDATA%\ClaudeUsageTray\settings.json`. Errors are logged to `error.log` in the same folder.
 
 Note: this endpoint is not a documented public API, so a future Claude Code release could change it.

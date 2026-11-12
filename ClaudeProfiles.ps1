@@ -36,22 +36,55 @@ function Read-ClaudeConfig {
     return (New-JsonSerializer).DeserializeObject([IO.File]::ReadAllText($script:ConfigFile))
 }
 
+# Which account does an access token really belong to? Asks Anthropic
+# (api/oauth/profile) and caches per token, so it's one call per token refresh.
+# Returns "<accountUuid>_<orgUuid>" (same as profile ids), or $null if unknown.
+$script:TokenIdCache = @{}
+function Get-TokenIdentity([string]$Token) {
+    if (-not $Token) { return $null }
+    if ($script:TokenIdCache.ContainsKey($Token)) { return $script:TokenIdCache[$Token] }
+    try {
+        $r = Invoke-RestMethod -Uri 'https://api.anthropic.com/api/oauth/profile' -TimeoutSec 15 -UseBasicParsing `
+            -Headers @{ Authorization = "Bearer $Token"; 'anthropic-beta' = 'oauth-2025-04-20' }
+        if (-not $r.account.uuid -or -not $r.organization.uuid) { return $null }
+        $id = '{0}_{1}' -f $r.account.uuid, $r.organization.uuid
+        if ($script:TokenIdCache.Count -gt 50) { $script:TokenIdCache.Clear() }
+        $script:TokenIdCache[$Token] = $id
+        return $id
+    } catch { return $null }   # offline / expired: unknown, callers must not trust it
+}
+
+# The signed-in account. Claude Code keeps the tokens (.credentials.json) and
+# the account details (.claude.json oauthAccount) in separate files, and a
+# Claude Code session still running on an old account can rewrite the tokens
+# after a switch. So the tokens are checked against the server:
+#   Id         - who the tokens really belong to (falls back to ConfigId if the check fails)
+#   ConfigId   - who .claude.json says is signed in
+#   Verified   - the token check succeeded
+#   Mismatch   - verified and the two disagree (tokens belong to a different account)
 function Get-ActiveAccount {
     if (-not (Test-Path $script:ConfigFile) -or -not (Test-Path $script:CredFile)) { return $null }
     $acct = (Read-ClaudeConfig)['oauthAccount']
     if (-not $acct) { return $null }
+    $configId = '{0}_{1}' -f $acct['accountUuid'], $acct['organizationUuid']
+    $token = $null
+    try { $token = ((New-JsonSerializer).DeserializeObject([IO.File]::ReadAllText($script:CredFile)))['claudeAiOauth']['accessToken'] } catch {}
+    $tokenId = Get-TokenIdentity $token
     return [pscustomobject]@{
-        Id      = '{0}_{1}' -f $acct['accountUuid'], $acct['organizationUuid']
-        Email   = $acct['emailAddress']
-        Org     = $acct['organizationName']
-        Account = $acct
+        Id       = if ($tokenId) { $tokenId } else { $configId }
+        ConfigId = $configId
+        Verified = [bool]$tokenId
+        Mismatch = [bool]($tokenId -and $tokenId -ne $configId)
+        Email    = $acct['emailAddress']
+        Org      = $acct['organizationName']
+        Account  = $acct
     }
 }
 
-function Get-ClaudeProfiles {
+function Get-ClaudeProfiles($Active = $null) {
     if (-not (Test-Path $script:ProfilesDir)) { return @() }
     $js = New-JsonSerializer
-    $active = Get-ActiveAccount
+    $active = if ($Active) { $Active } else { Get-ActiveAccount }
     @(Get-ChildItem $script:ProfilesDir -Directory | ForEach-Object {
         $metaPath = Join-Path $_.FullName 'profile.json'
         if (Test-Path $metaPath) {
@@ -96,10 +129,23 @@ function Save-ProfileSnapshot([string]$CredText, $Account, [string]$Name) {
 
 # Snapshot the currently signed-in account into its profile (creating it if new).
 # Called on every tray poll so stored refresh tokens never go stale.
-function Sync-ActiveProfile([string]$Name) {
-    $active = Get-ActiveAccount
-    if (-not $active) { return $null }
-    return Save-ProfileSnapshot ([IO.File]::ReadAllText($script:CredFile)) $active.Account $Name
+# Only saves tokens once the server has confirmed whose they are, so one
+# account's login can never be stored under another account's profile.
+function Sync-ActiveProfile([string]$Name, $Active = $null) {
+    $active = if ($Active) { $Active } else { Get-ActiveAccount }
+    if (-not $active -or -not $active.Verified) { return $null }
+    $cred = [IO.File]::ReadAllText($script:CredFile)
+    if (-not $active.Mismatch) { return Save-ProfileSnapshot $cred $active.Account $Name }
+
+    # Tokens belong to a different account than .claude.json says. If we know
+    # that account, keep its (possibly just-refreshed) tokens in its own profile.
+    $dir = Join-Path $script:ProfilesDir $active.Id
+    $acctPath = Join-Path $dir 'oauthAccount.json'
+    if (Test-Path $acctPath) {
+        $acct = (New-JsonSerializer).DeserializeObject([IO.File]::ReadAllText($acctPath))
+        return Save-ProfileSnapshot $cred $acct $null
+    }
+    return $null
 }
 
 # Import a login made in a separate CLAUDE_CONFIG_DIR (see claude-profile add).
@@ -238,6 +284,14 @@ function Get-UsageRows([string]$Token) {
         $code = $null
         try { $code = [int]$_.Exception.Response.StatusCode } catch {}
         if ($code -eq 401) { throw 'Token expired. Open Claude Code once to refresh it.' }
+        if ($code -eq 429) {
+            $retry = 0
+            try { $retry = [int]$_.Exception.Response.Headers['Retry-After'] } catch {}
+            $ex = New-Object System.Exception 'Rate limited by Anthropic; backing off.'
+            $ex.Data['RateLimited'] = $true
+            $ex.Data['RetryAfter'] = $retry
+            throw $ex
+        }
         throw "Request failed: $($_.Exception.Message)"
     }
 
@@ -276,11 +330,14 @@ function Find-ClaudeProfile([string]$NameOrId) {
 }
 
 function Switch-ClaudeProfile([string]$NameOrId) {
+    $active = Get-ActiveAccount
     $target = Find-ClaudeProfile $NameOrId
-    if ($target.Active) { return $target }
+    # Already active and consistent: nothing to do. (On a mismatch we still write
+    # both files, which repairs them.)
+    if ($target.Active -and -not ($active -and $active.Mismatch)) { return $target }
 
-    # Keep the outgoing account's (possibly refreshed) tokens.
-    Sync-ActiveProfile | Out-Null
+    # Keep the outgoing account's (possibly refreshed) tokens - only once verified.
+    Sync-ActiveProfile $null $active | Out-Null
 
     $js = New-JsonSerializer
     $cred = [IO.File]::ReadAllText((Join-Path $target.Path 'credentials.json'))

@@ -46,7 +46,11 @@ $ProfileCli   = Join-Path $PSScriptRoot 'claude-profile.ps1'
 . (Join-Path $PSScriptRoot 'ClaudeProfiles.ps1')
 $script:ActiveName = $null
 
-$Settings = [ordered]@{ ShowOverlay = $true; X = -1; Y = -1; IntervalSec = 120; Opacity = 0.92 }
+$Settings = [ordered]@{
+    ShowOverlay       = $true; X = -1; Y = -1; Opacity = 0.92
+    ActiveIntervalSec = 60    # how often the active account is checked (drives auto-switch)
+    OthersIntervalMin = 10    # how often other accounts are checked while "All" is on
+}
 if (Test-Path $SettingsPath) {
     try {
         $s = Get-Content $SettingsPath -Raw | ConvertFrom-Json
@@ -78,6 +82,12 @@ if ($Settings.Contains('AutoSwitchMinLeft'))  { $Settings.Remove('AutoSwitchMinL
 function Get-SwitchRules {
     New-SwitchRules $Settings.AutoSwitchAt $Settings.AutoSwitchMinSession $Settings.AutoSwitchMinWeekly $Settings.AutoSwitchPrefer
 }
+if ($Settings.Contains('IntervalSec')) { $Settings.Remove('IntervalSec') }  # replaced by ActiveIntervalSec
+$script:OthersFetchedAt   = [datetime]::MinValue
+$script:BackoffUntil      = [datetime]::MinValue
+$script:BackoffSec        = 0
+$script:Mismatch          = $false
+$script:MismatchNotified  = $false
 $script:AutoCooldownUntil = [datetime]::MinValue
 $script:AutoNotified      = $false
 $script:SwitchRects       = @()   # clickable account names in the overlay: @{ Rect; Id }
@@ -110,11 +120,36 @@ function Parse-Date($s) {
     try { return [datetime]::Parse($s, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind) } catch { return $null }
 }
 
-function Update-Usage {
+function Start-Backoff([int]$retryAfter) {
+    $next = if ($script:BackoffSec -gt 0) { $script:BackoffSec * 2 } else { 120 }
+    $script:BackoffSec = [math]::Min(900, [math]::Max($retryAfter, $next))
+    $script:BackoffUntil = (Get-Date).AddSeconds($script:BackoffSec)
+    $script:LastErr = 'Rate limited - retrying at {0}' -f $script:BackoffUntil.ToString('HH:mm')
+}
+
+# -Full also refreshes the other accounts now instead of on their own schedule.
+function Update-Usage([switch]$Full) {
+    # Rate limited: don't touch the network until the backoff ends.
+    if ((Get-Date) -lt $script:BackoffUntil) { Update-Ui; return }
     # Keep the active account's profile snapshot current (tokens rotate on refresh).
+    # Identity comes from the tokens themselves (checked with Anthropic), not
+    # just .claude.json - see Get-ActiveAccount.
     try {
-        Sync-ActiveProfile | Out-Null
-        $script:ActiveName = (Get-ClaudeProfiles | Where-Object Active | Select-Object -First 1).Name
+        $acct = Get-ActiveAccount
+        Sync-ActiveProfile $null $acct | Out-Null
+        $profiles = Get-ClaudeProfiles $acct
+        $script:ActiveName = ($profiles | Where-Object Active | Select-Object -First 1).Name
+        $script:Mismatch = [bool]($acct -and $acct.Mismatch)
+        if ($script:Mismatch) {
+            $cfgName = ($profiles | Where-Object Id -eq $acct.ConfigId | Select-Object -First 1).Name
+            if (-not $cfgName) { $cfgName = $acct.Email }
+            if (-not $script:ActiveName) { $script:ActiveName = 'Unknown account' }
+            if (-not $script:MismatchNotified) {
+                $tray.ShowBalloonTip(10000, 'Claude login was overwritten',
+                    ("A Claude Code session still running on {0} rewrote the login after you switched to {1}. New sessions will use {0}. Close running Claude Code sessions, then switch again. Auto-switch is paused until this is fixed." -f $script:ActiveName, $cfgName), 'Warning')
+                $script:MismatchNotified = $true
+            }
+        } else { $script:MismatchNotified = $false }
         $script:ProfSig = Get-ProfilesSignature
     } catch {}
     try {
@@ -125,21 +160,38 @@ function Update-Usage {
         $script:Rows    = Get-UsageRows $cred.accessToken
         $script:LastErr = $null
         $script:LastOk  = Get-Date
+        $script:BackoffSec = 0
     } catch {
+        if ($_.Exception.Data['RateLimited']) {
+            # Keep showing the last numbers; wait (server hint, else doubling from 2 min, max 15 min).
+            Start-Backoff ([int]$_.Exception.Data['RetryAfter'])
+            Update-Ui
+            return
+        }
         $script:LastErr = $_.Exception.Message
     }
-    if ($Settings.ShowAll) { Update-OtherAccounts }
+    # Other accounts change only when you use them, so they're checked on a slower
+    # schedule (and only while "All" is on). Auto-switch always re-checks them first.
+    $othersDue = ((Get-Date) - $script:OthersFetchedAt).TotalMinutes -ge [double]$Settings.OthersIntervalMin
+    if ($Settings.ShowAll -and ($Full -or $othersDue)) { Update-OtherAccounts }
     if (Invoke-AutoSwitch) { return }   # switched: it already refreshed everything
     Update-Ui
 }
 
-# Usage for every saved account except the active one. Fetched each poll while
-# "All" is on, otherwise only when auto-switch needs it.
+# Usage for every saved account except the active one.
 function Update-OtherAccounts {
+    $script:OthersFetchedAt = Get-Date
     $list = @()
     foreach ($p in (Get-ClaudeProfiles | Where-Object { -not $_.Active })) {
         $entry = @{ Id = $p.Id; Name = $p.Name; Rows = @(); Err = $null; Eligible = $false }
-        try { $entry.Rows = Get-UsageRows (Get-ProfileAccessToken $p) } catch { $entry.Err = $_.Exception.Message }
+        try { $entry.Rows = Get-UsageRows (Get-ProfileAccessToken $p) } catch {
+            if ($_.Exception.Data['RateLimited']) {
+                # Keep the previous numbers for everyone and stop asking.
+                Start-Backoff ([int]$_.Exception.Data['RetryAfter'])
+                return
+            }
+            $entry.Err = $_.Exception.Message
+        }
         $list += $entry
     }
     # Order = auto-switch priority, so the top one is "next up".
@@ -149,11 +201,16 @@ function Update-OtherAccounts {
 # Returns $true if it switched accounts.
 function Invoke-AutoSwitch {
     if (-not $Settings.AutoSwitch -or $script:LastErr -or -not $script:Rows) { return $false }
+    if ($script:Mismatch) { return $false }   # login files disagree: don't make it worse
     $used = Get-MaxUsed $script:Rows
     if ($used -lt [double]$Settings.AutoSwitchAt) { $script:AutoNotified = $false; return $false }
     if ((Get-Date) -lt $script:AutoCooldownUntil) { return $false }
 
-    if (-not $Settings.ShowAll) { Update-OtherAccounts }   # need fresh numbers to choose
+    # Choose from fresh numbers. If we already found nobody qualifies, don't
+    # re-check every account each minute - wait for their normal schedule.
+    $othersDue = ((Get-Date) - $script:OthersFetchedAt).TotalMinutes -ge [double]$Settings.OthersIntervalMin
+    if (-not $script:AutoNotified -or $othersDue) { Update-OtherAccounts }
+    if ((Get-Date) -lt $script:BackoffUntil) { return $false }   # rate limited mid-check: numbers may be stale
     $target = Select-AutoSwitchTarget $script:Others (Get-SwitchRules)
     if (-not $target) {
         if (-not $script:AutoNotified) {
@@ -176,7 +233,7 @@ function Invoke-AutoSwitch {
     $script:AutoNotified = $false
     $tray.ShowBalloonTip(8000, 'Claude auto-switched account',
         ("{0} reached {1}% used. Now using {2}. Restart running Claude Code sessions to pick it up." -f $from, [int]$used, $target.Name), 'Info')
-    Update-Usage
+    Update-Usage -Full
     return $true
 }
 
@@ -241,18 +298,20 @@ function Update-Ui {
     if ($old -ne [IntPtr]::Zero) { [Native.Win32]::DestroyIcon($old) | Out-Null }
     $script:LastHIcon = $new.Handle
 
-    # Tooltip (max 127 chars)
+    # Tooltip: Windows (.NET Framework) allows at most 63 characters.
     if ($script:Rows) {
         $parts = foreach ($r in $script:Rows) {
-            $lbl = $r.Label -replace 'Session \(5h\)', '5h' -replace 'Weekly ', 'Wk '
-            '{0}: {1}' -f $lbl, (Format-Pct $r)
+            $lbl = $r.Label -replace '^Session \(5h\)$', '5h' -replace '^Weekly$', 'Wk' -replace '^Weekly ', ''
+            $pct = if ($Settings.ShowRemaining) { 100 - $r.Used } else { $r.Used }
+            '{0} {1}%' -f $lbl, [int][math]::Max(0, [math]::Min(100, $pct))
         }
-        $tip = 'Claude  ' + ($parts -join ' | ')
-        if ($script:LastErr) { $tip = '[stale] ' + $tip }
+        $kind = if ($Settings.ShowRemaining) { 'left' } else { 'used' }
+        $tip = "Claude ${kind}: " + ($parts -join ', ')
+        if ($script:LastErr) { $tip = '(stale) ' + $tip }
     } else {
-        $tip = 'Claude usage: ' + $script:LastErr
+        $tip = 'Claude: ' + $script:LastErr
     }
-    if ($tip.Length -gt 127) { $tip = $tip.Substring(0, 124) + '...' }
+    if ($tip.Length -gt 63) { $tip = $tip.Substring(0, 60) + '...' }
     $tray.Text = $tip
 
     $overlay.Height = Get-OverlayHeight
@@ -316,6 +375,7 @@ function Add-RadioGroup($parent, [string]$heading, $options, [string]$key) {
             foreach ($sib in $s.Owner.Items) {
                 if ($sib.Tag -is [hashtable] -and $sib.Tag.Key -eq $s.Tag.Key) { $sib.Checked = ($sib -eq $s) }
             }
+            if ($s.Tag.Key -eq 'ActiveIntervalSec') { $timer.Interval = [int]$s.Tag.Value * 1000 }
             # Re-rank with the new rules so NEXT / reasons update immediately.
             if ($script:Others) { $script:Others = Sort-SwitchCandidates $script:Others (Get-SwitchRules) }
             Update-Ui
@@ -329,6 +389,14 @@ $miAuto.DropDownItems.Add('-') | Out-Null
 Add-RadioGroup $miAuto 'Target needs weekly left' @(@(0, 'Any (just not full)'), @(5, '5%'), @(10, '10%'), @(25, '25%')) 'AutoSwitchMinWeekly'
 $miAuto.DropDownItems.Add('-') | Out-Null
 Add-RadioGroup $miAuto 'Prefer' @(@('reset', 'Soonest weekly reset (use it before it expires)'), @('room', 'Most weekly room left')) 'AutoSwitchPrefer'
+
+# Refresh-rate submenu (inserted under the main menu's "Refresh now")
+$miRate = New-Object System.Windows.Forms.ToolStripMenuItem 'Check usage every'
+$menu.Items.Insert(($menu.Items.IndexOf($miRefresh) + 1), $miRate)
+Add-RadioGroup $miRate 'Active account (drives auto-switch)' @(@(30, '30 seconds (may hit rate limits)'), @(60, '1 minute'), @(120, '2 minutes'), @(300, '5 minutes')) 'ActiveIntervalSec'
+$miRate.DropDownItems.Add('-') | Out-Null
+Add-RadioGroup $miRate 'Other accounts (while All is on)' @(@(5, '5 minutes'), @(10, '10 minutes'), @(15, '15 minutes'), @(30, '30 minutes')) 'OthersIntervalMin'
+$note = $miRate.DropDownItems.Add('Auto-switch always re-checks them before switching'); $note.Enabled = $false
 
 $miAccount = New-Object System.Windows.Forms.ToolStripMenuItem 'Account'
 $menu.Items.Add($miAccount) | Out-Null
@@ -462,8 +530,12 @@ $overlay.Add_Paint({
     $g.FillRectangle($btnBr, $script:BtnAdd)
     $g.DrawString('+', $fontTitle, $fgMain, [System.Drawing.RectangleF]$script:BtnAdd, $cf)
 
-    $g.DrawString('ACTIVE', $fontTag, $accentBr, 10, 8)
-    if ($Settings.AutoSwitch) {
+    if ($script:Mismatch) {
+        $g.DrawString('LOGIN OVERWRITTEN - restart Claude Code', $fontTag, $warnBr, 10, 8)
+    } else {
+        $g.DrawString('ACTIVE', $fontTag, $accentBr, 10, 8)
+    }
+    if ($Settings.AutoSwitch -and -not $script:Mismatch) {
         $tag = 'AUTO @ {0}%' -f $Settings.AutoSwitchAt
         $g.DrawString($tag, $fontTag, $fgDim, 58, 8)
     }
@@ -488,7 +560,8 @@ $overlay.Add_Paint({
     if ($Settings.ShowAll) {
         $y += 6
         if (-not $script:Others) {
-            $g.DrawString('No other saved accounts. Click + to add one.', $fontSmall, $fgDim, 10, $y)
+            $msg = if ($script:OthersFetchedAt -eq [datetime]::MinValue) { 'Other accounts not checked yet...' } else { 'No other saved accounts. Click + to add one.' }
+            $g.DrawString($msg, $fontSmall, $fgDim, 10, $y)
         }
         $first = $true
         foreach ($o in $script:Others) {
@@ -552,7 +625,7 @@ $overlay.Add_MouseDown({
         Save-Settings
     }
 })
-$overlay.Add_MouseDoubleClick({ Update-Usage })
+$overlay.Add_MouseDoubleClick({ Update-Usage -Full })
 
 # ---------- menu handlers ----------
 $miOverlay.Add_CheckedChanged({
@@ -560,7 +633,7 @@ $miOverlay.Add_CheckedChanged({
     $overlay.Visible = $miOverlay.Checked
     Save-Settings
 })
-$miRefresh.Add_Click({ Update-Usage })
+$miRefresh.Add_Click({ Update-Usage -Full })
 $miShowAll.Add_Click({ Set-ShowAll (-not $Settings.ShowAll) })
 $miWeb.Add_Click({ Start-Process 'https://claude.ai/settings/usage' })
 $miStartup.Add_CheckedChanged({
@@ -588,7 +661,7 @@ $miExit.Add_Click({
 
 # ---------- timers ----------
 $timer = New-Object System.Windows.Forms.Timer
-$timer.Interval = [math]::Max(30, [int]$Settings.IntervalSec) * 1000
+$timer.Interval = [math]::Max(30, [int]$Settings.ActiveIntervalSec) * 1000
 $timer.Add_Tick({ Update-Usage })
 
 # Profiles folder + active account fingerprint. Changes when an account is added,
@@ -631,7 +704,8 @@ $overlay.Show()
 # ShowWindow call, so force it visible explicitly (SW_SHOWNOACTIVATE = 4).
 [Native.Win32]::ShowWindow($overlay.Handle, 4) | Out-Null
 if (-not $Settings.ShowOverlay) { $overlay.Hide() }
-Update-Usage
+# First refresh runs before the message loop, where WinForms can't catch errors for us.
+try { Update-Usage } catch { try { Add-Content $LogPath ("{0}  startup: {1}" -f (Get-Date -Format s), $_.Exception) } catch {} }
 $timer.Start(); $tickTimer.Start()
 
 [System.Windows.Forms.Application]::Run()
