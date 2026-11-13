@@ -35,6 +35,8 @@ Click **+** on the overlay, choose **Account → Add account (without switching)
 
 Click **All** on the overlay (or **Show all accounts** in the menu) to list usage for every saved account under the active one. You can also run `claude-profile usage` in a terminal. Inactive accounts use their saved tokens. When a saved access token expires, it's refreshed through the same OAuth endpoint Claude Code uses, and the new tokens are written straight back to that profile. The active account's tokens are never refreshed here; Claude Code owns those.
 
+Right-click an account's card on the overlay to **Check this account now** (refreshes its login if needed and fetches its usage; the result also pops up as a notification with the server's exact answer), **Switch to this account**, or **Sign in again (without switching)** if its saved login was revoked.
+
 ### Auto-switch
 
 **Tray → Auto-switch → Enabled** (off by default) switches accounts for you when the active account runs out:
@@ -90,12 +92,16 @@ These cover the login-file handling (verification, mismatch protection, switchin
 It polls `https://api.anthropic.com/api/oauth/usage`, the same data Claude Code's `/usage` shows. Set the timing under **Tray → Check usage every**:
 
 - **Active account:** every **2 minutes** by default (30 seconds to 5 minutes). This drives auto-switch. Shorter intervals react faster but are more likely to hit Anthropic's rate limit.
-- **Other accounts:** every **10 minutes** by default (5 to 30 minutes), and only while **All** is on. Auto-switch always re-checks them right before choosing.
+- **Other accounts:** every **10 minutes** by default (5 to 30 minutes), and only while **All** is on. Auto-switch always re-checks them right before choosing. They're checked 4 seconds apart, not in one burst.
 - **Refresh now** or double-clicking the overlay checks everything immediately.
 
 All network calls run on a background thread, so the overlay and menus never freeze while checking. Saved accounts are listed by name straight away, marked **NOT CHECKED** until their numbers arrive.
 
 The endpoint is rate-limited. If Anthropic answers *429 Too Many Requests*, the tray keeps showing the last numbers, marks them stale (**retry HH:mm** in the overlay header), and pauses: for the server's `Retry-After` time if it gives a useful one, otherwise for 2 minutes, doubling up to 15 minutes. The pause is saved in `state.json`, so restarting the tray doesn't reset it. Auto-switch is paused while rate-limited.
+
+If only the other accounts are turned away (their login refresh or usage check gets a 429), they get a pause of their own, from 2 minutes doubling up to an hour, while the active account keeps updating. Their cards show **Refused by server (429) - retry HH:mm**. A saved login the server rejects outright shows **Saved login was revoked**; use **Sign in again** on its card.
+
+Every request to Anthropic is logged (time, endpoint, account, HTTP status) to `%APPDATA%\ClaudeUsageTray\requests.log`, kept under about 256 KB, so you can see exactly how often the tray talks to the servers. Requests identify themselves as `claude-usage-tray-win/1.0`: the login server rejects PowerShell's default browser-like User-Agent with a 429.
 
 **Login safety:** Claude Code stores tokens and account details in separate files, and a Claude Code session still running on an old account can rewrite the tokens after a switch. So the tray checks who a token really belongs to (`api/oauth/profile`, cached per token) before saving it into a profile. If the files disagree, it saves the tokens only to their real owner's profile, shows **LOGIN OVERWRITTEN** on the overlay with a notification, and pauses auto-switch. Close the running Claude Code sessions and switch again; switching rewrites both files and clears the warning.
 

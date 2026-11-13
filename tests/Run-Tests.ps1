@@ -32,7 +32,7 @@ function Get-TokenIdentity([string]$Token) { if ($script:FakeIds.ContainsKey($To
 
 # Invoke-RestMethod stand-in: functions win over cmdlets, so the module uses this.
 $script:RestCalls = @(); $script:RestReply = $null
-function Invoke-RestMethod { param($Uri, $Method, $Headers, $Body, $ContentType, $TimeoutSec, [switch]$UseBasicParsing)
+function Invoke-RestMethod { param($Uri, $Method, $Headers, $Body, $ContentType, $TimeoutSec, $UserAgent, [switch]$UseBasicParsing)
     $script:RestCalls += @{ Uri = $Uri; Method = $Method; Body = $Body }
     if ($script:RestReply -is [scriptblock]) { return (& $script:RestReply $Uri $Body) }
     return $script:RestReply
@@ -55,6 +55,7 @@ function Reset-Sandbox($ConfigAccount, [string]$CredText) {
     $script:ConfigFile  = Join-Path $Root '.claude.json'
     $script:CredFile    = Join-Path $Root '.credentials.json'
     $script:ProfilesDir = Join-Path $Root 'profiles'
+    $script:RequestLog  = Join-Path $Root 'requests.log'
     $cfg = @{ numStartups = 42; projects = @{ 'C:\x' = @{ allowedTools = @() } }; unicode = "caf$([char]0xE9) <tag> & 'q'"; oauthAccount = $ConfigAccount }
     [IO.File]::WriteAllText($script:ConfigFile, $js.Serialize($cfg))
     [IO.File]::WriteAllText($script:CredFile, $CredText)
@@ -166,6 +167,34 @@ Test 'expired inactive token is refreshed and the rotated tokens are saved' {
     $saved = $js.DeserializeObject([IO.File]::ReadAllText((Join-Path $p.Path 'credentials.json')))['claudeAiOauth']
     Assert-Equal 'r-new' $saved['refreshToken'] 'rotated refresh token saved'
     Assert-Equal 'user:inference' (@($saved['scopes'])[0]) 'other fields kept'
+}
+
+# An HTTP error as Invoke-RestMethod throws it (only the bits the module reads).
+function New-HttpError([int]$Status, [hashtable]$Headers = @{}) {
+    $e = New-Object System.Exception "HTTP $Status"
+    Add-Member -InputObject $e NoteProperty Response ([pscustomobject]@{ StatusCode = $Status; Headers = $Headers })
+    return $e
+}
+
+Test 'a rate-limited refresh is reported as rate limited, not as an expired login' {
+    Reset-Sandbox $A (New-Cred 'tokA'); $script:FakeIds['tokA'] = $AId
+    Save-ProfileSnapshot (New-Cred 'tokB-old' 'r-old' -60000) $B $null | Out-Null
+    $script:RestReply = { throw (New-HttpError 429 @{ 'Retry-After' = '300' }) }
+    $p = Get-ClaudeProfiles | Where-Object Id -eq $BId
+    $ex = $null; try { Get-ProfileAccessToken $p | Out-Null } catch { $ex = $_.Exception }
+    Assert-True ($ex -and $ex.Data['RateLimited']) 'rate limited'
+    Assert-Equal 300 $ex.Data['RetryAfter'] 'retry after'
+    Assert-True ([IO.File]::ReadAllText((Join-Path $p.Path 'credentials.json')) -match 'r-old') 'saved login untouched'
+}
+
+Test 'a rejected refresh token asks to sign in again' {
+    Reset-Sandbox $A (New-Cred 'tokA'); $script:FakeIds['tokA'] = $AId
+    Save-ProfileSnapshot (New-Cred 'tokB-old' 'r-old' -60000) $B $null | Out-Null
+    $script:RestReply = { throw (New-HttpError 400) }
+    $p = Get-ClaudeProfiles | Where-Object Id -eq $BId
+    $ex = $null; try { Get-ProfileAccessToken $p | Out-Null } catch { $ex = $_.Exception }
+    Assert-True ($ex -and -not $ex.Data['RateLimited']) 'not rate limited'
+    Assert-True ($ex.Message -match 'Add account') 'tells how to fix'
 }
 
 Test 'the active account always uses the live token (never refreshed here)' {

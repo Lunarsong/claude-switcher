@@ -446,6 +446,22 @@ test("expired inactive token is refreshed and the rotated tokens are saved") {
     try assertEqual("user:inference", s["scopes"]?.array?.first?.string, "other fields kept")
 }
 
+test("a rate-limited refresh is reported as rate limited, not as an expired login") {
+    resetSandbox(A, cred("tokA")); fakeIds["tokA"] = AId
+    try acc.saveProfileSnapshot(credText: cred("tokB-old", refresh: "r-old", expiresInMs: -60000), account: B, name: nil)
+    http.reply = { _ in FakeHTTP.json("{}", status: 429, headers: ["retry-after": "300"]) }
+    do { _ = try acc.accessToken(for: profile(BId)!); throw AssertFail(m: "should throw") }
+    catch UsageError.rateLimited(let ra) { try assertEqual(300, ra, "retry after") }
+}
+
+test("a rejected refresh token asks to sign in again") {
+    resetSandbox(A, cred("tokA")); fakeIds["tokA"] = AId
+    try acc.saveProfileSnapshot(credText: cred("tokB-old", refresh: "r-old", expiresInMs: -60000), account: B, name: nil)
+    http.reply = { _ in FakeHTTP.json(#"{"error":"invalid_grant"}"#, status: 400) }
+    do { _ = try acc.accessToken(for: profile(BId)!); throw AssertFail(m: "should throw") }
+    catch { try assertTrue("\(error)".contains("Add account"), "tells how to fix") }
+}
+
 test("the active account always uses the live token (never refreshed here)") {
     resetSandbox(A, cred("tokA", refresh: "r-A", expiresInMs: -60000)); fakeIds["tokA"] = AId; acc.syncActiveProfile()
     try assertEqual("tokA", try acc.accessToken(for: profile(AId)!), "live token")

@@ -572,8 +572,15 @@ final class ClaudeAccounts {
         req.setValue(Self.userAgent, forHTTPHeaderField: "User-Agent")
         req.httpBody = Data(JSON.object(body).serialized(indent: nil).utf8)
         let r = http.send(req)
+        // The token endpoint is rate-limited too: that's not a dead login, so back off
+        // (the caller stops refreshing other accounts) and retry later.
+        if r.status == 429 { throw UsageError.rateLimited(retryAfter: Int(r.headers["retry-after"] ?? "") ?? 0) }
+        if r.status == 400 || r.status == 401 {
+            throw CoreError("Saved login was revoked. Use \"Add account\" to sign in to it again.")
+        }
         guard r.status == 200, let j = try? JSON.parse(r.body), let access = j["access_token"]?.string else {
-            throw CoreError("Saved login expired and could not be refreshed. Switch to this account in Claude Code (or sign in again).")
+            throw CoreError(r.status == 0 ? "Couldn't refresh saved login (offline?). Will retry."
+                                          : "Couldn't refresh saved login (HTTP \(r.status)). Will retry.")
         }
         o["accessToken"] = .string(access)
         if let rt = j["refresh_token"]?.string { o["refreshToken"] = .string(rt) }

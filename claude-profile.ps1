@@ -71,7 +71,7 @@ function Show-AllUsage {
         $mark = if ($p.Active) { '*' } else { ' ' }
         Write-Host (' {0} {1}' -f $mark, $p.Name) -ForegroundColor Cyan
         try {
-            foreach ($r in (Get-UsageRows (Get-ProfileAccessToken $p))) {
+            foreach ($r in (Get-UsageRows (Get-ProfileAccessToken $p) "$($p.Email) (cli)")) {
                 $reset = if ($r.Resets) { $r.Resets.ToLocalTime().ToString('ddd HH:mm') } else { '' }
                 Write-Host ('     {0,-16} {1,3}% used   resets {2}' -f $r.Label, [int][math]::Min(100, $r.Used), $reset)
             }

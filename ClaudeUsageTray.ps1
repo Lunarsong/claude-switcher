@@ -139,6 +139,7 @@ $script:MismatchNotified  = $false
 $script:AutoCooldownUntil = [datetime]::MinValue
 $script:AutoNotified      = $false
 $script:SwitchRects       = @()   # clickable account names in the overlay: @{ Rect; Id }
+$script:CardRects         = @()   # whole account cards (right-click menu): @{ Rect; Id }
 if ($null -eq $Settings.NotifyAt)    { $Settings.NotifyAt = 80 }      # warn when a limit reaches this % (0 = off)
 if ($null -eq $Settings.NotifyReset) { $Settings.NotifyReset = $true } # tell me when a limit resets
 $script:NoticeStates      = @{}   # per account id: state for Get-UsageNotices
@@ -268,7 +269,7 @@ $FetchScript = {
         if (-not (Test-Path $CredPath)) { throw "No Claude Code login found. Run 'claude' and log in." }
         $token = ((New-JsonSerializer).DeserializeObject([IO.File]::ReadAllText($CredPath)))['claudeAiOauth']['accessToken']
         if (-not $token) { throw "No login token found. Run 'claude' and log in." }
-        $out.Rows = Get-UsageRows $token
+        $out.Rows = Get-UsageRows $token "$($out.Acct.Email) (active)"
     } catch {
         if ($_.Exception.Data['RateLimited']) {
             $out.RateLimited = $true; $out.RetryAfter = [int]$_.Exception.Data['RetryAfter']
@@ -278,9 +279,14 @@ $FetchScript = {
     }
     if ($WantOthers) {
         $list = @()
+        $first = $true
         foreach ($p in ($out.Profiles | Where-Object { -not $_.Active })) {
+            # Pace the checks: a burst of refresh + usage calls for every account
+            # gets rate-limited. This is the background worker, so the UI is unaffected.
+            if (-not $first) { Start-Sleep -Seconds 4 }
+            $first = $false
             $entry = @{ Id = $p.Id; Name = $p.Name; Rows = @(); Err = $null; Eligible = $false; Reason = $null }
-            try { $entry.Rows = Get-UsageRows (Get-ProfileAccessToken $p) } catch {
+            try { $entry.Rows = Get-UsageRows (Get-ProfileAccessToken $p) $p.Email } catch {
                 if ($_.Exception.Data['RateLimited']) {
                     $out.OthersRateLimited = $true; $out.RetryAfter = [int]$_.Exception.Data['RetryAfter']
                     break
@@ -294,9 +300,40 @@ $FetchScript = {
     return $out
 }
 
-$script:Job          = $null    # @{ PS; Handle; WantOthers }
+# Check one saved account (right-click > Check this account now). Runs on the
+# same worker as the regular checks, so two refreshes of one account never race
+# (a refresh rotates the token; the loser would be left with a stale one).
+$CheckOneScript = {
+    param([string]$Id)
+    $out = @{ Id = $Id; Rows = @(); Err = $null }
+    try {
+        $p = Get-ClaudeProfiles | Where-Object Id -eq $Id | Select-Object -First 1
+        if (-not $p) { throw 'This account is no longer saved.' }
+        $out.Rows = Get-UsageRows (Get-ProfileAccessToken $p) "$($p.Email) (manual check)"
+    } catch {
+        $out.Err = $_.Exception.Message
+        $ra = [int]$_.Exception.Data['RetryAfter']
+        if ($ra -gt 0) { $out.Err += " Server says retry in $ra s." }
+    }
+    return $out
+}
+$script:QueuedChecks = New-Object System.Collections.Generic.List[string]
+
+$script:Job          = $null    # @{ PS; Handle; WantOthers; CheckId }
 $script:QueuedOthers = $null    # $null = nothing queued, else [bool] whether others are wanted
 $script:LastAcct     = $null    # last Get-ActiveAccount result from the worker
+
+# Other accounts get their own pause when the server turns them away, so a
+# working active account doesn't reset it (that used to retry every 2 minutes).
+# Doubles from 2 minutes up to an hour; in memory only.
+$script:OthersBackoffSec   = 0
+$script:OthersBackoffUntil = [datetime]::MinValue
+function Test-OthersPaused { (Get-Date) -lt $script:OthersBackoffUntil }
+function Start-OthersBackoff([int]$retryAfter) {
+    $next = if ($script:OthersBackoffSec -gt 0) { $script:OthersBackoffSec * 2 } else { 120 }
+    $script:OthersBackoffSec = [math]::Min(3600, [math]::Max($retryAfter, $next))
+    $script:OthersBackoffUntil = (Get-Date).AddSeconds($script:OthersBackoffSec)
+}
 
 function Test-OthersDue {
     ((Get-Date) - $script:OthersFetchedAt).TotalMinutes -ge [double]$Settings.OthersIntervalMin
@@ -309,8 +346,31 @@ function Update-Usage([switch]$Full) {
     Request-Refresh $wantOthers
 }
 
+function Request-AccountCheck([string]$Id) {
+    $o = @($script:Others) | Where-Object { $_.Id -eq $Id } | Select-Object -First 1
+    if ($o) { $o.Rows = @(); $o.Err = 'Checking...'; $o.Pending = $true; Update-Ui }
+    if ($script:Job) { if (-not $script:QueuedChecks.Contains($Id)) { $script:QueuedChecks.Add($Id) }; return }
+    $ps = [powershell]::Create(); $ps.Runspace = $script:WorkerRs
+    $ps.AddScript($CheckOneScript).AddArgument($Id) | Out-Null
+    $script:Job = @{ PS = $ps; Handle = $ps.BeginInvoke(); WantOthers = $false; CheckId = $Id }
+    $jobWatch.Start()
+}
+
+function Apply-AccountCheck($r) {
+    $o = @($script:Others) | Where-Object { $_.Id -eq $r.Id } | Select-Object -First 1
+    $name = if ($o) { $o.Name } else { 'Account' }
+    if ($o) {
+        $o.Rows = @($r.Rows); $o.Err = $r.Err; $o.Pending = $false
+        $script:Others = Sort-SwitchCandidates @($script:Others) (Get-SwitchRules)
+    }
+    if ($r.Err) { $tray.ShowBalloonTip(8000, "$name - check failed", $r.Err, 'Warning') }
+    else        { $tray.ShowBalloonTip(4000, $name, 'Checked: login is working and usage is up to date.', 'Info') }
+    Update-Ui
+}
+
 function Request-Refresh([bool]$WantOthers) {
     if (Test-Paused) { Update-Ui; return }   # rate limited: stay off the network
+    if (Test-OthersPaused) { $WantOthers = $false }
     if ($script:Job) {
         # Busy: remember to run again afterwards (merging "others" requests).
         $script:QueuedOthers = [bool]($WantOthers -or $script:QueuedOthers)
@@ -325,18 +385,27 @@ function Request-Refresh([bool]$WantOthers) {
 # Runs on the UI thread when the worker finishes.
 function Complete-Refresh {
     $job = $script:Job
-    $r = $null
+    $r = $null; $jobErr = $null
     try {
         $res = $job.PS.EndInvoke($job.Handle)
         if ($res -and $res.Count) { $r = $res[0] }
     } catch {
-        $script:LastErr = $_.Exception.Message
+        $jobErr = $_.Exception.Message
+        # A failed single-account check is that account's problem, not the tray's.
+        if (-not $job.CheckId) { $script:LastErr = $jobErr }
     } finally {
         $job.PS.Dispose()
         $script:Job = $null
     }
-    if ($r) { Apply-Result $r }
+    if ($r) { if ($job.CheckId) { Apply-AccountCheck $r } else { Apply-Result $r } }
+    elseif ($job.CheckId) { Apply-AccountCheck @{ Id = $job.CheckId; Rows = @(); Err = $jobErr } }
 
+    # Single-account checks first (someone is waiting on them), then queued regular checks.
+    if ($script:QueuedChecks.Count) {
+        $next = $script:QueuedChecks[0]; $script:QueuedChecks.RemoveAt(0)
+        Request-AccountCheck $next
+        return
+    }
     if ($null -ne $script:QueuedOthers) {
         $q = $script:QueuedOthers; $script:QueuedOthers = $null
         Request-Refresh $q
@@ -385,10 +454,17 @@ function Apply-Result($r) {
         $script:Others = Sort-SwitchCandidates @($r.Others) (Get-SwitchRules)
         $script:OthersFetchedAt = Get-Date
         $othersFresh = $true
+        $script:OthersBackoffSec = 0; $script:OthersBackoffUntil = [datetime]::MinValue
     } elseif ($r.OthersRateLimited) {
-        Start-Backoff $r.RetryAfter     # keep previous numbers; OthersFetchedAt untouched so they're retried
+        # Keep previous numbers; only the other accounts wait. OthersFetchedAt is
+        # untouched so they're retried once the pause is over.
+        Start-OthersBackoff $r.RetryAfter
     }
     Set-OtherPlaceholders $r.Profiles
+    if (Test-OthersPaused) {
+        $msg = 'Refused by server (429) - retry {0}' -f $script:OthersBackoffUntil.ToString('HH:mm')
+        foreach ($o in @($script:Others)) { if ($o.Pending) { $o.Err = $msg } }
+    }
 
     Invoke-AutoSwitch $othersFresh
     Update-Ui
@@ -417,7 +493,7 @@ function Invoke-AutoSwitch([bool]$OthersFresh) {
 
     # Choose from fresh numbers. If we already found nobody qualifies, don't
     # re-check every account each minute - wait for their normal schedule.
-    if (-not $OthersFresh -and (-not $script:AutoNotified -or (Test-OthersDue))) { Request-Refresh $true; return }
+    if (-not $OthersFresh -and -not (Test-OthersPaused) -and (-not $script:AutoNotified -or (Test-OthersDue))) { Request-Refresh $true; return }
     $target = Select-AutoSwitchTarget $script:Others (Get-SwitchRules)
     if (-not $target) {
         if (-not $script:AutoNotified) {
@@ -710,7 +786,7 @@ $overlay.Height = [int](100 * $UiScale)
 $overlay.BackColor = [System.Drawing.Color]::FromArgb(30, 30, 34)
 $overlay.Opacity = [double]$Settings.Opacity
 $overlay.Text = 'Claude Usage'
-$overlay.ContextMenuStrip = $menu
+# Right-click menus are shown by hand (MouseUp): the account menu on a card, the main menu elsewhere.
 # double buffering to stop flicker
 $overlay.GetType().GetProperty('DoubleBuffered', [Reflection.BindingFlags]'Instance,NonPublic').SetValue($overlay, $true, $null)
 
@@ -808,7 +884,7 @@ $overlay.Add_Paint({
     foreach ($r in $activeRows) { Draw-UsageRow $g $r $y $w 18 $false; $y += 34 }
 
     # ---- Other accounts: plain, dimmed, in auto-switch priority order ----
-    $script:SwitchRects = @()
+    $script:SwitchRects = @(); $script:CardRects = @()
     if ($Settings.ShowAll) {
         $y += 6
         if (-not $script:Others) {
@@ -819,6 +895,7 @@ $overlay.Add_Paint({
             # Card background separates each account from the next.
             $cardH = Get-CardHeight $o
             $g.FillRectangle($cardBr, 4, $y, ($w - 8), $cardH)
+            $script:CardRects += @{ Rect = (New-Object System.Drawing.Rectangle(4, $y, ($w - 8), $cardH)); Id = $o.Id }
             $y += 7
             $link = New-Object System.Drawing.Rectangle(($w - 50), $y, 42, 16)
             $script:SwitchRects += @{ Rect = $link; Id = $o.Id }
@@ -886,6 +963,25 @@ $overlay.Add_MouseDown({
     }
 })
 $overlay.Add_MouseDoubleClick({ Update-Usage -Full })
+
+$cardMenu = New-Object System.Windows.Forms.ContextMenuStrip
+$cmCheck  = $cardMenu.Items.Add('Check this account now')
+$cmSwitch = $cardMenu.Items.Add('Switch to this account')
+$cardMenu.Items.Add('-') | Out-Null
+$cmSignIn = $cardMenu.Items.Add('Sign in again (without switching)...')
+$cmCheck.Add_Click({ Request-AccountCheck $cardMenu.Tag })
+$cmSwitch.Add_Click({ Invoke-SwitchAccount $cardMenu.Tag })
+$cmSignIn.Add_Click({ Start-AddAccount })
+
+$overlay.Add_MouseUp({
+    param($s, $e)
+    if ($e.Button -ne 'Right') { return }
+    $pt = New-Object System.Drawing.Point([int]($e.X / $UiScale), [int]($e.Y / $UiScale))
+    foreach ($cr in $script:CardRects) {
+        if ($cr.Rect.Contains($pt)) { $cardMenu.Tag = $cr.Id; $cardMenu.Show($overlay, $e.Location); return }
+    }
+    $menu.Show($overlay, $e.Location)
+})
 
 # ---------- menu handlers ----------
 $miOverlay.Add_CheckedChanged({

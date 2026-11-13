@@ -263,6 +263,18 @@ final class AppController: NSObject, ObservableObject, NSMenuDelegate, UNUserNot
 
     // MARK: background checks
 
+    /// Other accounts get their own pause when the server turns them away, so a
+    /// working active account doesn't reset it (that used to retry every poll).
+    /// Doubles from 2 minutes up to an hour; in memory only.
+    var othersBackoffSec = 0
+    var othersBackoffUntil = Date.distantPast
+    var othersPaused: Bool { Date() < othersBackoffUntil }
+    func startOthersBackoff(_ retryAfter: Int) {
+        let next = othersBackoffSec > 0 ? othersBackoffSec * 2 : 120
+        othersBackoffSec = min(3600, max(retryAfter, next))
+        othersBackoffUntil = Date().addingTimeInterval(Double(othersBackoffSec))
+    }
+
     func othersDue() -> Bool { Date().timeIntervalSince(othersFetchedAt) >= Double(settings.othersIntervalMin) * 60 }
 
     /// Ask for fresh numbers. full = also re-check other accounts now.
@@ -270,11 +282,13 @@ final class AppController: NSObject, ObservableObject, NSMenuDelegate, UNUserNot
         // Accounts never checked yet (new, or skipped while rate limited) can't wait 10 minutes.
         var wantOthers = settings.showAll && (full || othersDue() || others.contains(where: \.pending))
         if full && settings.autoSwitch { wantOthers = true }
+        if othersPaused { wantOthers = false }
         requestRefresh(wantOthers)
     }
 
-    func requestRefresh(_ wantOthers: Bool) {
+    func requestRefresh(_ want: Bool) {
         if paused { updateUI(); return }   // rate limited: stay off the network
+        let wantOthers = want && !othersPaused   // other accounts may be paused on their own
         if jobRunning {
             // Busy: run again afterwards (merging "others" requests).
             queuedOthers = wantOthers || (queuedOthers ?? false)
@@ -314,7 +328,10 @@ final class AppController: NSObject, ObservableObject, NSMenuDelegate, UNUserNot
         }
         if wantOthers {
             var list: [OtherAccount] = []
-            for p in out.profiles where !p.active {
+            for (i, p) in out.profiles.filter({ !$0.active }).enumerated() {
+                // Pace the checks: a burst of refresh + usage calls for every account
+                // gets rate-limited. This is the worker queue, so the UI is unaffected.
+                if i > 0 { Thread.sleep(forTimeInterval: 4) }
                 var entry = OtherAccount(id: p.id, name: p.name)
                 do { entry.rows = try acc.usageRows(token: try acc.accessToken(for: p)) }
                 catch UsageError.rateLimited(let ra) { out.othersRateLimited = true; out.retryAfter = ra; break }
@@ -373,10 +390,17 @@ final class AppController: NSObject, ObservableObject, NSMenuDelegate, UNUserNot
             others = sortSwitchCandidates(o, settings.rules)
             othersFetchedAt = Date()
             othersFresh = true
+            othersBackoffSec = 0; othersBackoffUntil = .distantPast
         } else if r.othersRateLimited {
-            startBackoff(r.retryAfter)   // keep previous numbers; othersFetchedAt untouched so they're retried
+            // Keep previous numbers; only the other accounts wait. othersFetchedAt is
+            // untouched so they're retried once the pause is over.
+            startOthersBackoff(r.retryAfter)
         }
         setOtherPlaceholders(r.profiles)
+        if othersPaused {
+            let msg = "Refused by server (429) - retry \(Self.hhmm.string(from: othersBackoffUntil))"
+            for i in others.indices where others[i].pending { others[i].err = msg }
+        }
 
         autoSwitch(othersFresh: othersFresh)
         updateUI()
@@ -464,7 +488,7 @@ final class AppController: NSObject, ObservableObject, NSMenuDelegate, UNUserNot
 
         // Choose from fresh numbers. If we already found nobody qualifies, don't
         // re-check every account each minute - wait for their normal schedule.
-        if !othersFresh && (!autoNotified || othersDue()) { requestRefresh(true); return }
+        if !othersFresh && !othersPaused && (!autoNotified || othersDue()) { requestRefresh(true); return }
         guard let target = selectAutoSwitchTarget(others, settings.rules) else {
             if !autoNotified {
                 var why = others.map { "\($0.name): \($0.reason ?? "")" }.joined(separator: "; ")

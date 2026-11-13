@@ -15,6 +15,25 @@ $script:ClaudeDir     = Join-Path $env:USERPROFILE '.claude'
 $script:CredFile      = Join-Path $script:ClaudeDir '.credentials.json'
 $script:ConfigFile    = Join-Path $env:USERPROFILE '.claude.json'
 $script:ProfilesDir   = Join-Path $env:APPDATA 'ClaudeUsageTray\profiles'
+# Identify this app honestly (like the Mac version). PowerShell's default
+# User-Agent poses as a browser ("Mozilla/5.0 ..."), which bot protection rejects.
+$script:UserAgent     = 'claude-usage-tray-win/1.0'
+$script:RequestLog    = Join-Path $env:APPDATA 'ClaudeUsageTray\requests.log'
+
+# One line per request to Anthropic (time, endpoint, account, result), so you can
+# see exactly how often the tray talks to the servers. Kept under ~256 KB.
+function Write-RequestLog([string]$Endpoint, [string]$Who, $Status) {
+    try {
+        if ((Test-Path $script:RequestLog) -and (Get-Item $script:RequestLog).Length -gt 256KB) {
+            Move-Item $script:RequestLog "$($script:RequestLog).old" -Force
+        }
+        Add-Content $script:RequestLog ('{0}  {1,-8} {2,-40} {3}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Endpoint, $Who, $Status)
+    } catch {}
+}
+function Get-HttpStatus($ErrorRecord) {
+    try { $c = [int]$ErrorRecord.Exception.Response.StatusCode; if ($c) { return $c } } catch {}
+    return "failed: $($ErrorRecord.Exception.Message)"
+}
 
 function New-JsonSerializer {
     $js = New-Object System.Web.Script.Serialization.JavaScriptSerializer
@@ -44,8 +63,11 @@ function Get-TokenIdentity([string]$Token) {
     if (-not $Token) { return $null }
     if ($script:TokenIdCache.ContainsKey($Token)) { return $script:TokenIdCache[$Token] }
     try {
-        $r = Invoke-RestMethod -Uri 'https://api.anthropic.com/api/oauth/profile' -TimeoutSec 15 -UseBasicParsing `
-            -Headers @{ Authorization = "Bearer $Token"; 'anthropic-beta' = 'oauth-2025-04-20' }
+        try {
+            $r = Invoke-RestMethod -Uri 'https://api.anthropic.com/api/oauth/profile' -TimeoutSec 15 -UseBasicParsing -UserAgent $script:UserAgent `
+                -Headers @{ Authorization = "Bearer $Token"; 'anthropic-beta' = 'oauth-2025-04-20' }
+            Write-RequestLog 'profile' '(live login)' 200
+        } catch { Write-RequestLog 'profile' '(live login)' (Get-HttpStatus $_); throw }
         if (-not $r.account.uuid -or -not $r.organization.uuid) { return $null }
         $id = '{0}_{1}' -f $r.account.uuid, $r.organization.uuid
         if ($script:TokenIdCache.Count -gt 50) { $script:TokenIdCache.Clear() }
@@ -189,9 +211,27 @@ function Get-ProfileAccessToken($P) {
     $body = @{ grant_type = 'refresh_token'; refresh_token = $o['refreshToken']; client_id = $script:OAuthClient }
     if ($o['scopes']) { $body.scope = (@($o['scopes']) -join ' ') }
     try {
-        $r = Invoke-RestMethod -Method Post -Uri $script:TokenUrl -ContentType 'application/json' -Body ($body | ConvertTo-Json) -TimeoutSec 20 -UseBasicParsing
+        $r = Invoke-RestMethod -Method Post -Uri $script:TokenUrl -ContentType 'application/json' -Body ($body | ConvertTo-Json) -TimeoutSec 20 -UseBasicParsing -UserAgent $script:UserAgent
+        Write-RequestLog 'refresh' $P.Email 200
     } catch {
-        throw 'Saved login expired and could not be refreshed. Switch to this account in Claude Code (or sign in again).'
+        Write-RequestLog 'refresh' $P.Email (Get-HttpStatus $_)
+        $code = $null
+        try { $code = [int]$_.Exception.Response.StatusCode } catch {}
+        if ($code -eq 429) {
+            # The token endpoint is rate-limited too. Not a dead login: back off
+            # (the caller stops refreshing other accounts) and retry later.
+            $retry = 0
+            try { $retry = [int]$_.Exception.Response.Headers['Retry-After'] } catch {}
+            $ex = New-Object System.Exception 'Login refresh was rate limited by Anthropic (HTTP 429).'
+            $ex.Data['RateLimited'] = $true
+            $ex.Data['RetryAfter'] = $retry
+            throw $ex
+        }
+        if ($code -eq 400 -or $code -eq 401) {
+            throw 'Saved login was revoked. Use "Add account" to sign in to it again.'
+        }
+        if ($code) { throw "Couldn't refresh saved login (HTTP $code). Will retry." }
+        throw "Couldn't refresh saved login (offline?). Will retry."
     }
     $o['accessToken'] = $r.access_token
     if ($r.refresh_token) { $o['refreshToken'] = $r.refresh_token }
@@ -331,11 +371,13 @@ function ConvertFrom-UsageDate($s) {
 }
 
 # Returns @( @{ Label; Used; Resets } ... ) for a token. Throws with a readable message.
-function Get-UsageRows([string]$Token) {
+function Get-UsageRows([string]$Token, [string]$Who = '') {
     $headers = @{ Authorization = "Bearer $Token"; 'anthropic-beta' = 'oauth-2025-04-20' }
     try {
-        $r = Invoke-RestMethod -Uri $script:UsageUrl -Headers $headers -TimeoutSec 15 -UseBasicParsing
+        $r = Invoke-RestMethod -Uri $script:UsageUrl -Headers $headers -TimeoutSec 15 -UseBasicParsing -UserAgent $script:UserAgent
+        Write-RequestLog 'usage' $Who 200
     } catch {
+        Write-RequestLog 'usage' $Who (Get-HttpStatus $_)
         $code = $null
         try { $code = [int]$_.Exception.Response.StatusCode } catch {}
         if ($code -eq 401) { throw 'Token expired. Open Claude Code once to refresh it.' }
